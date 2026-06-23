@@ -6,63 +6,72 @@ import zipfile
 import io
 import os
 import json
-import google.generativeai as genai
 import time
+import re
+import google.generativeai as genai
 
 st.set_page_config(page_title="Extrator de Notas Fiscais (IA Inteligente)", layout="wide")
 
 # --- CONFIGURAÇÃO DA IA ---
-# A chave de API deve ser configurada nos Secrets do Streamlit Cloud
 CHAVE_API = st.secrets.get("GEMINI_API_KEY", "")
 
 if CHAVE_API:
     genai.configure(api_key=CHAVE_API)
-    # Usamos o modelo flash por ser rápido e excelente em extração de dados
     modelo_ia = genai.GenerativeModel('gemini-1.5-flash')
 
 # --- FUNÇÃO DA INTELIGÊNCIA ARTIFICIAL ---
 def extrair_dados_com_ia(texto_nota):
-    """Envia o texto da nota para a IA analisar o contexto e extrair os dados."""
+    """Envia o texto da nota para a IA analisar o contexto de forma estruturada."""
     prompt = f"""
-    Você é um assistente especialista em contabilidade e notas fiscais brasileiras (NFS-e e NF-e).
-    Vou te passar o texto extraído de um PDF de nota fiscal. O texto pode estar bagunçado.
-    Leia com calma, analise o contexto e encontre exatamente os seguintes dados:
-    1. Número da Nota
-    2. CNPJ do Fornecedor (Prestador do serviço ou Emitente. Ignore o CNPJ do tomador/cliente ou da prefeitura).
-    3. Nome do Fornecedor (Razão Social ou Nome Fantasia do Prestador/Emitente. Não confunda com órgãos públicos ou com o cliente).
-    4. Valor Total ou Líquido da nota.
-    5. Data de Emissão.
-
-    Retorne APENAS um objeto JSON válido e nada mais, com estas chaves exatas:
+    Você é um assistente especialista em contabilidade. Analise o texto desta nota fiscal e extraia os dados abaixo.
+    Retorne ESTRITAMENTE um JSON válido com estas chaves exatas (e nada mais):
     {{"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}}
-    Se não encontrar algum dado com certeza, deixe a string vazia "".
 
-    Texto da Nota Fiscal:
+    Regras:
+    - Fornecedor: É o Prestador de Serviços ou Emitente. Ignore nomes de prefeituras, municípios ou do tomador.
+    - CNPJ: O CNPJ do Prestador/Emitente.
+    - Data: Formato DD/MM/AAAA.
+    - Valor: O valor total ou líquido do serviço (apenas o número e a vírgula).
+    Se não encontrar a informação, deixe a string vazia "".
+
+    Texto da Nota:
     {texto_nota}
     """
     
     try:
-        resposta = modelo_ia.generate_content(prompt)
+        # Força o retorno estrito em JSON (requer versões recentes do google-generativeai)
+        resposta = modelo_ia.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(response_mime_type="application/json")
+        )
+        
         texto_resposta = resposta.text.strip()
         
-        # Limpa formatações markdown caso a IA retorne com elas
-        if texto_resposta.startswith("```json"):
-            texto_resposta = texto_resposta[7:-3]
-        elif texto_resposta.startswith("```"):
-            texto_resposta = texto_resposta[3:-3]
-            
-        dados_json = json.loads(texto_resposta.strip())
+        # Limpeza de segurança caso a IA ainda retorne blocos markdown
+        if texto_resposta.startswith("```"):
+            match = re.search(r'\{.*\}', texto_resposta, re.DOTALL)
+            if match:
+                texto_resposta = match.group(0)
+                
+        dados_json = json.loads(texto_resposta)
         return dados_json
+        
     except Exception as e:
-        return {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
+        # AGORA O ERRO É MOSTRADO, NÃO MAIS OCULTADO
+        return {
+            "Número da Nota": "Erro", 
+            "CNPJ": "Erro", 
+            "Valor": "Erro", 
+            "Data": "Erro", 
+            "Fornecedor": f"Erro na IA: {str(e)[:50]}"
+        }
 
 # --- EXTRAÇÃO DE ARQUIVOS ---
 def extrair_dados_xml(conteudo_bytes):
-    """Para XML, a extração via código é 100% segura, não precisa de IA."""
+    """Extração pura para arquivos XML."""
     dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
     try:
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
-        import re
         xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str) 
         root = ET.fromstring(xml_str)
         
@@ -70,8 +79,7 @@ def extrair_dados_xml(conteudo_bytes):
             if parent is None: return ""
             for tag in tags:
                 el = parent.find(f".//{tag}")
-                if el is not None and el.text:
-                    return el.text.strip()
+                if el is not None and el.text: return el.text.strip()
             return ""
 
         numero = buscar_tag(['nNF', 'Numero', 'numeroNota', 'nNFse'])
@@ -86,16 +94,14 @@ def extrair_dados_xml(conteudo_bytes):
             dados["Fornecedor"] = buscar_tag(['xFant', 'nomeFantasia', 'xNome', 'RazaoSocial'])
 
         dados["Valor"] = buscar_tag(['vNF', 'ValorServicos', 'valorLiquido', 'vProd', 'vLiq'])
-
         data = buscar_tag(['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi'])
-        if data and len(data) >= 10:
-            dados["Data"] = data[:10]
-    except Exception:
-        pass
+        if data and len(data) >= 10: dados["Data"] = data[:10]
+    except Exception as e:
+        dados["Fornecedor"] = f"Erro no XML: {str(e)[:30]}"
     return dados
 
 def processar_arquivo(item):
-    """Lê o arquivo um por um, com calma."""
+    """Lê o arquivo de forma linear e aciona a IA com limite de tempo."""
     nome_arquivo, conteudo = item
     nome_lower = nome_arquivo.lower()
     
@@ -103,34 +109,40 @@ def processar_arquivo(item):
     if nome_lower.endswith('.xml'):
         dados = extrair_dados_xml(conteudo)
     elif nome_lower.endswith('.pdf'):
-        # Extrai o texto base
         texto_pdf = ""
         try:
             with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
                 for pagina in pdf.pages:
                     t = pagina.extract_text()
                     if t: texto_pdf += t + "\n"
-        except Exception:
-            pass
+        except Exception as e:
+            dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": f"PDF corrompido: {str(e)[:30]}"}
             
-        if texto_pdf.strip():
-            # Passa para a IA ler com contexto humano
-            dados = extrair_dados_com_ia(texto_pdf)
-            # Pausa de 1 segundo para não sobrecarregar a API gratuita
-            time.sleep(1)
+        if dados is None: # Se não falhou ao abrir
+            if texto_pdf.strip():
+                # Passa para a IA ler
+                dados = extrair_dados_com_ia(texto_pdf)
+                # PAUSA OBRIGATÓRIA DE 4.2 SEGUNDOS PARA NÃO BLOQUEAR A API DO GOOGLE (15/min)
+                time.sleep(4.2)
+            else:
+                dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "PDF sem texto (Imagem escaneada)"}
         
     if not dados:
-        dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
+        dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "Formato desconhecido"}
         
     dados["Arquivo"] = os.path.basename(nome_arquivo)
-    return dados
+    
+    # Garante a formatação final das chaves para evitar erros no Pandas
+    chaves_corretas = ["Número da Nota", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
+    dados_finais = {k: dados.get(k, "") for k in chaves_corretas}
+    return dados_finais
 
 # --- INTERFACE DO STREAMLIT ---
 st.title("🧠 Extrator de Notas Fiscais Inteligente (Com IA)")
-st.write("Este sistema usa Inteligência Artificial para ler cada PDF e interpretar os dados de fornecedores, ignorando formatos confusos de prefeituras.")
+st.write("Leitura nota por nota, com pausas programadas para evitar o bloqueio da Inteligência Artificial.")
 
 if not CHAVE_API:
-    st.error("⚠️ Falta configurar a chave da API do Gemini. Vá nos Secrets do Streamlit e adicione `GEMINI_API_KEY = 'sua_chave'`.")
+    st.error("⚠️ Atenção: A chave da API do Gemini não foi detectada. Verifique os Secrets do Streamlit Cloud.")
 
 arquivos_carregados = st.file_uploader(
     "Escolha os arquivos XML/PDF ou um arquivo ZIP", 
@@ -152,19 +164,22 @@ if arquivos_carregados and CHAVE_API:
                                 if not nome_interno.startswith('__MACOSX') and not os.path.basename(nome_interno).startswith('.'):
                                     lista_arquivos.append((nome_interno, z.read(nome_interno)))
                 except Exception as e:
-                    st.error(f"Erro ao ler o arquivo ZIP {arq.name}: {e}")
+                    st.error(f"Erro ao ler ZIP: {e}")
             else:
                 lista_arquivos.append((arq.name, arq.read()))
 
     total_arquivos = len(lista_arquivos)
     
     if total_arquivos > 0:
-        st.info(f"Total de {total_arquivos} notas detectadas. A IA fará a leitura individual detalhada (isso pode levar alguns minutos)...")
+        # Previsão de tempo para tranquilizar o usuário
+        tempo_estimado_min = (total_arquivos * 4.2) / 60
+        st.info(f"Total de {total_arquivos} notas. Tempo estimado da IA: ~{tempo_estimado_min:.1f} minutos. Deixe a página aberta!")
         
         barra_progresso = st.progress(0)
         resultados = []
         
-        # Leitura sequencial "com calma", uma por vez, para alta precisão e sem estourar limites de API
+        # O processamento agora é intencionalmente sequencial (sem ThreadPoolExecutor) 
+        # para garantir que a API do Google não receba conexões paralelas que resultem em bloqueio.
         for i, item in enumerate(lista_arquivos):
             resultado = processar_arquivo(item)
             resultados.append(resultado)
@@ -173,13 +188,7 @@ if arquivos_carregados and CHAVE_API:
         if resultados:
             df = pd.DataFrame(resultados)
             
-            colunas_ordem = ["Número da Nota", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
-            for col in colunas_ordem:
-                if col not in df.columns:
-                    df[col] = ""
-            df = df[colunas_ordem]
-            
-            st.success(f"Leitura concluída com precisão para {total_arquivos} notas.")
+            st.success("Leitura concluída!")
             
             st.subheader("📋 Pré-visualização dos Dados")
             st.dataframe(df, use_container_width=True)
@@ -192,8 +201,6 @@ if arquivos_carregados and CHAVE_API:
             st.download_button(
                 label="📥 Baixar Tabela em Excel",
                 data=dados_excel,
-                file_name="Notas_Fiscais_Processadas.xlsx",
+                file_name="Notas_Fiscais_Processadas_IA.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.warning("Nenhum dado pôde ser processado.")
