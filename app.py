@@ -17,7 +17,7 @@ def extrair_dados_xml(conteudo_bytes):
     try:
         # Remove namespaces para facilitar a busca por tags
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
-        xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str)  # Corrigido regex de namespace
+        xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str)
         root = ET.fromstring(xml_str)
         
         def buscar_tag(tags):
@@ -104,7 +104,6 @@ def processar_arquivo(item):
 st.title("⚡ Extrator Ultrarápido de Notas Fiscais (XML / PDF)")
 st.write("Anexe arquivos soltos ou um arquivo **.ZIP** contendo até milhares de notas fiscais.")
 
-# Removido o parâmetro obsoleto 'allow_output_mutation' que causava o TypeError
 arquivos_carregados = st.file_uploader(
     "Escolha os arquivos XML/PDF ou um arquivo ZIP", 
     type=["xml", "pdf", "zip"], 
@@ -119,12 +118,10 @@ if arquivos_carregados:
         for arq in arquivos_carregados:
             if arq.name.lower().endswith('.zip'):
                 try:
-                    # Lê os bytes do zip de forma limpa
                     zip_data = arq.read()
                     with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
                         for nome_interno in z.namelist():
                             if nome_interno.lower().endswith(('.xml', '.pdf')):
-                                # Evita arquivos temporários ocultos de sistemas operacionais (como __MACOSX)
                                 if not nome_interno.startswith('__MACOSX') and not os.path.basename(nome_interno).startswith('.'):
                                     lista_arquivos.append((nome_interno, z.read(nome_interno)))
                 except Exception as e:
@@ -157,7 +154,7 @@ if arquivos_carregados:
             # Garante que todas as colunas pedidas existam na ordem correta
             colunas_ordem = ["Número da Nota", "Razão Social", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
             for col in colunas_ordem:
-                if col Republican not in df.columns:
+                if col not in df.columns:
                     df[col] = ""
             df = df[colunas_ordem]
             
