@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import xml.etree.ElementTree as ET
 import pdfplumber
-from pypdf import PdfReader
 import zipfile
 import io
 import re
@@ -44,10 +43,32 @@ def formatar_cnpj(cnpj_str):
         return f"{cnpj_limpo[:2]}.{cnpj_limpo[2:5]}.{cnpj_limpo[5:8]}/{cnpj_limpo[8:12]}-{cnpj_limpo[12:]}"
     return cnpj_str
 
+def eh_nome_valido(texto):
+    """Valida se o texto extraído é realmente o nome de um fornecedor ou se é lixo/título da nota."""
+    if not texto or len(texto.strip()) < 3:
+        return False
+    
+    # Palavras que indicam títulos da nota ou órgãos públicos (não são o fornecedor)
+    palavras_proibidas = [
+        "PREFEITURA", "MUNICÍPIO", "MUNICIPIO", "SECRETARIA", "ESTADO", "FEDERAL", 
+        "NOTA FISCAL", "NFS-E", "NF-E", "ELETRÔNICA", "ELETRONICA", "DIRETORIA",
+        "PRESTADOR", "TOMADOR", "SERVIÇO", "SERVICO", "DADOS DO", "IDENTIFICAÇÃO",
+        "EMITENTE", "DESTINATÁRIO", "DE SERVI", "DA NFS", "NOME / RAZÃO SOCIAL",
+        "RAZÃO SOCIAL", "RAZAO SOCIAL", "NOME FANTASIA", "INSCRICAO", "INSCRIÇÃO",
+        "CADASTRO", "CONTRIBUINTE", "ASSINATURA", "VALIDADE", "AUTENTICIDADE"
+    ]
+    
+    texto_upper = texto.upper().strip()
+    for palavra in palavras_proibidas:
+        if palavra in texto_upper:
+            return False
+            
+    return True
+
 # --- FUNÇÕES DE EXTRAÇÃO DE DADOS ---
 
 def extrair_dados_xml(conteudo_bytes, nome_arquivo):
-    """Extrai dados de um XML de NF-e/NFS-e dando prioridade ao Nome Fantasia."""
+    """Extrai dados de um XML de NF-e/NFS-e padrão."""
     try:
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
         xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str)
@@ -63,8 +84,9 @@ def extrair_dados_xml(conteudo_bytes, nome_arquivo):
         numero = buscar_tag(['nNF', 'Numero', 'numeroNota', 'nNFse', 'numNota'])
         cnpj = buscar_tag(['CNPJ', 'Cnpj', 'cnpjPrestador', 'cnpjEmitente'])
         
-        # PRIORIDADE: Nome Fantasia (Nome Real Comercial) -> Se não houver, usa Razão Social
-        fornecedor = buscar_tag(['xFant', 'nomeFantasia', 'xNome', 'RazaoSocial', 'nomePrestador', 'nomeEmitente'])
+        fornecedor = buscar_tag(['xFant', 'nomeFantasia'])
+        if not fornecedor or not eh_nome_valido(fornecedor):
+            fornecedor = buscar_tag(['xNome', 'RazaoSocial', 'nomePrestador', 'nomeEmitente'])
         
         valor = buscar_tag(['vNF', 'ValorServicos', 'valorLiquido', 'vProd', 'vBC', 'vLiq'])
         data = buscar_tag(['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi', 'dhCompetencia', 'dtEmi'])
@@ -87,27 +109,27 @@ def extrair_dados_xml(conteudo_bytes, nome_arquivo):
         return None
 
 def extrair_dados_pdf(conteudo_bytes, nome_arquivo):
-    """Extrai dados de um PDF usando pdfplumber para ler layouts complexos e tabelas ocultas."""
+    """Extrai dados de um PDF usando pdfplumber com filtragem avançada anti-falsos positivos."""
     try:
         texto = ""
-        # pdfplumber consegue extrair textos que o pypdf ignora (essencial para notas geradas como quase-imagem)
+        linhas = []
         with pdfplumber.open(io.BytesIO(conteudo_bytes)) as pdf:
             for pagina in pdf.pages:
                 texto_pag = pagina.extract_text()
                 if texto_pag:
                     texto += texto_pag + "\n"
+                    linhas.extend([l.strip() for l in texto_pag.split('\n') if l.strip()])
 
-        # Se mesmo com pdfplumber o texto vier vazio, o PDF é 100% uma imagem escaneada.
         if not texto.strip():
             return {
-                "Número da Nota": extrair_numero_do_nome_arquivo(nome_arquivo) or "PDF Escaneado",
-                "CNPJ": "Requer OCR Externo",
+                "Número da Nota": extrair_numero_do_nome_arquivo(nome_arquivo) or "PDF Sem Texto",
+                "CNPJ": "Requer OCR",
                 "Valor": "0,00",
                 "Data": "Requer OCR",
-                "Fornecedor": "Imagem Escaneada (Sem texto copiável)"
+                "Fornecedor": "Imagem Escaneada"
             }
 
-        # 1. Captura Inteligente do Número da Nota
+        # 1. Captura do Número da Nota
         numero = ""
         padroes_numero = [
             r'(?:NÚMERO|NUMERO|Nº\s*DA\s*NOTA|Nº|Nota\s*Nº)\s*[:.]?\s*([0-9\.\-/]+)',
@@ -139,50 +161,48 @@ def extrair_dados_pdf(conteudo_bytes, nome_arquivo):
                 valor = todos_valores[-1]
 
         # 4. Captura de Data
-        data_match = re.search(r'(\d{2}/A?\d{2}/\d{4})', texto)
+        data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto)
         data = data_match.group(1) if data_match else "Não encontrada"
 
-        # 5. Captura Avançada do Fornecedor (Foco em Nome Fantasia / Comercial)
+        # 5. Captura Inteligente e Filtrada do Fornecedor (Foco em eliminar lixos estruturais)
         fornecedor = ""
-        linhas = [l.strip() for l in texto.split('\n') if l.strip()]
         
-        # Estratégia 1: Procurar explicitamente por "Nome Fantasia" ou "Nome Comercial"
+        # Estratégia A: Varredura por proximidade de marcadores de Nome/Razão Social/Fantasia
         for idx, linha in enumerate(linhas):
-            match_fantasia = re.search(r'(?:Nome Fantasia|Nome Comercial|Título Estabelecimento)\s*[:.]?\s*([^\n\t\:]+)', linha, re.IGNORECASE)
-            if match_fantasia and len(match_fantasia.group(1).strip()) > 3:
-                candidato = match_fantasia.group(1).strip()
-                if not re.search(r'(?:CNPJ|Inscrição|Endereço|Prefeitura)', candidato, re.IGNORECASE):
-                    fornecedor = candidato
+            if re.search(r'(?:Nome Fantasia|Nome Comercial|Razão Social|Razao Social|Prestador|Emitente|Nome\s*/\s*Razão\s*Social)', linha, re.IGNORECASE):
+                # Testa se o nome válido está na própria linha (pós-separador)
+                candidato_linha = re.sub(r'^.*(?:Nome Fantasia|Nome Comercial|Razão Social|Razao Social|Prestador|Emitente|Nome\s*/\s*Razão\s*Social)\s*[:.]?\s*', '', linha, flags=re.IGNORECASE).strip()
+                if eh_nome_valido(candidato_linha):
+                    fornecedor = candidato_linha
                     break
-        
-        # Estratégia 2: Se não achou a tag "Nome Fantasia", busca o Prestador mitigando termos genéricos
-        if not fornecedor:
-            for idx, linha in enumerate(linhas):
-                if re.search(r'(?:Razão Social|Razao Social|Prestador|Emitente|Nome\s*/\s*Razão\s*Social)', linha, re.IGNORECASE):
-                    if len(linha) < 25 and idx + 1 < len(linhas):
-                        candidato = linhas[idx + 1]
-                    else:
-                        candidato = re.sub(r'(?:Razão Social|Razao Social|Prestador|Emitente|Nome\s*/\s*Razão\s*Social)\s*[:.]?\s*', '', linha, flags=re.IGNORECASE)
-                    
-                    if candidato and not re.search(r'(?:CNPJ|Inscrição|Endereço|Bairro|Cidade|UF|CEP|Telefone|Dados do|Documento|NFS-e|Nota)', candidato, re.IGNORECASE):
-                        if len(candidato.strip()) > 3:
-                            fornecedor = candidato.strip()
+                
+                # Se não estava na mesma linha, verifica as 2 linhas subsequentes (comum em quebras de tabela)
+                for k in range(1, 3):
+                    if idx + k < len(linhas):
+                        candidato_vizinho = linhas[idx + k]
+                        if eh_nome_valido(candidato_vizinho):
+                            fornecedor = candidato_vizinho
                             break
-
-        # Limpeza fina de labels capturados acidentalmente
-        if fornecedor:
-            fornecedor = re.sub(r'\s*(?:CNPJ|Inscrição|CPF|E-mail|Fone|Telefone|Endereço).*$', '', fornecedor, flags=re.IGNORECASE).strip()
-            if fornecedor.upper() in ["PRESTADOR DE SERVIÇOS", "DADOS DO PRESTADOR", "EMITENTE", "NOME / RAZÃO SOCIAL", "DE SERVI", "DA NFS"]:
-                fornecedor = ""
-
-        # Estratégia 3: Fallback para o topo da nota desconsiderando órgãos públicos
-        if not fornecedor:
-            for linha in linhas[:8]:
-                if len(linha) > 4 and not re.search(r'(?:PREFEITURA|MUNICÍPIO|NOTA FISCAL|ELETRÔNICA|SECRETARIA|NFS-e|ISS|TRIBUTOS|ESTADO|FEDERAL)', linha, re.IGNORECASE):
-                    fornecedor = linha
+                if fornecedor:
                     break
-            if not fornecedor:
-                fornecedor = "Verificar no PDF"
+
+        # Estratégia B: Se a estratégia A falhou ou trouxe lixo, busca a primeira linha corporativa válida fora do cabeçalho público
+        if not fornecedor or not eh_nome_valido(fornecedor):
+            for linha in linhas[:12]: # Varre o topo da nota
+                if eh_nome_valido(linha) and len(linha) > 5:
+                    # Evita linhas que começam com números soltos ou endereços óbvios
+                    if not re.search(r'^(?:RUA|AV\.|AVENIDA|PRAÇA|PC\.)', linha, re.IGNORECASE) and not re.search(r'^\d', linha):
+                        fornecedor = linha
+                        break
+
+        # Limpeza final cirúrgica para remover dados residuais na mesma linha
+        if fornecedor:
+            fornecedor = re.sub(r'\s*(?:CNPJ|Inscrição|CPF|E-mail|Fone|Telefone|Endereço|Bairro|CEP|Cidade|UF).*$', '', fornecedor, flags=re.IGNORECASE).strip()
+            # Remove pontuações soltas no fim do nome
+            fornecedor = fornecedor.rstrip(':-. ')
+            
+        if not fornecedor or not eh_nome_valido(fornecedor):
+            fornecedor = "Verificar no PDF"
 
         return {
             "Número da Nota": numero if numero else "Não identificado",
@@ -197,7 +217,7 @@ def extrair_dados_pdf(conteudo_bytes, nome_arquivo):
             "CNPJ": "Erro",
             "Valor": "0,00",
             "Data": "Erro",
-            "Fornecedor": "Falha na leitura do PDF"
+            "Fornecedor": "Falha no processador"
         }
 
 # --- PROCESSADOR INDIVIDUAL ---
