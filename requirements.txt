@@ -3,6 +3,4 @@ pandas
 pypdf
 pdfplumber
 openpyxl
-pytesseract
-pdf2image
-Pillow
+google-generativeai
