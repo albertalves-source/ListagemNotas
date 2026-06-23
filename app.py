@@ -7,18 +7,40 @@ import io
 import re
 import os
 from concurrent.futures import ThreadPoolExecutor
-import pytesseract
-from pdf2image import convert_from_bytes
 
-st.set_page_config(page_title="Extrator Exato de Notas Fiscais + OCR", layout="wide")
+st.set_page_config(page_title="Extrator de Notas Fiscais (Leitura Profunda)", layout="wide")
+
+# --- LISTA NEGRA DE PALAVRAS (Evita pegar prefeituras e lixos) ---
+BLACKLIST_FORNECEDOR = [
+    "PREFEITURA", "MUNICÍPIO", "MUNICIPIO", "SECRETARIA", "ESTADO", "GOVERNO",
+    "NOTA FISCAL", "ELETRÔNICA", "ELETRONICA", "NFS-E", "NF-E", "DANFE",
+    "DOCUMENTO", "AUXILIAR", "IMPOSTO", "TRIBUTO", "TOMADOR", "DESTINATÁRIO",
+    "COMPROVANTE", "RECIBO", "DADOS DO", "PRESTADOR", "EMITENTE", "SERVIÇO",
+    "ENDEREÇO", "BAIRRO", "CEP", "MUNICÍPIO", "UF", "TELEFONE", "E-MAIL"
+]
+
+def texto_valido_para_fornecedor(texto):
+    """Verifica se o texto capturado não é um título ou lixo do layout."""
+    texto_upper = texto.upper()
+    if len(texto) < 3:
+        return False
+    # Se contém qualquer palavra da lista negra, é lixo
+    for palavra in BLACKLIST_FORNECEDOR:
+        if palavra in texto_upper:
+            return False
+    # Se for só números ou começar com endereço, é lixo
+    if re.search(r'^\d+$', texto) or re.search(r'^(RUA|AV|AVENIDA|ALAMEDA|TRAVESSA|RODOVIA|LOTE|QDA|QUADRA)', texto_upper):
+        return False
+    return True
 
 # --- FUNÇÕES DE EXTRAÇÃO ---
 
 def extrair_dados_xml(conteudo_bytes):
+    """Extração 100% precisa das tags do XML."""
     dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
     try:
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
-        xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str)
+        xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str) # Remove namespaces para não atrapalhar
         root = ET.fromstring(xml_str)
         
         def buscar_tag(tags, parent=root):
@@ -32,6 +54,7 @@ def extrair_dados_xml(conteudo_bytes):
         numero = buscar_tag(['nNF', 'Numero', 'numeroNota', 'nNFse'])
         if numero: dados["Número da Nota"] = numero.lstrip('0')
 
+        # Garante que pega do Prestador e não do Tomador
         prestador = root.find('.//Prestador') or root.find('.//emit') or root.find('.//PrestadorServico')
         if prestador is not None:
             dados["CNPJ"] = buscar_tag(['CNPJ', 'Cnpj'], prestador)
@@ -54,86 +77,88 @@ def extrair_dados_xml(conteudo_bytes):
         pass
     return dados
 
-def parse_texto_pdf(texto):
-    """Analisa o texto extraído buscando âncoras exatas."""
-    dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
-    
-    if not texto.strip():
-        return dados
-
-    # 1. Data (Primeira data no formato DD/MM/AAAA)
-    datas = re.findall(r'\b\d{2}/\d{2}/\d{4}\b', texto)
-    if datas: 
-        dados["Data"] = datas[0]
-
-    # 2. CNPJ (Primeiro CNPJ válido = Prestador)
-    cnpjs = re.findall(r'\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b', texto)
-    if cnpjs: 
-        dados["CNPJ"] = cnpjs[0]
-
-    # 3. Valor (Procura formato financeiro)
-    valores_str = re.findall(r'R\$\s*([\d\.]+(?:,\d{2}))', texto)
-    if valores_str:
-        dados["Valor"] = valores_str[-1] # Geralmente o total líquido fica no fim da nota
-
-    # 4. Número da Nota
-    m_num = re.search(r'(?:N[UÚ]MERO|N[uú]mero da Nota|Nº|NF-e|NFS-e)[\s:\-\.]*0*(\d{1,15})\b', texto, re.IGNORECASE)
-    if m_num:
-        dados["Número da Nota"] = m_num.group(1)
-
-    # 5. Fornecedor (Busca ancorada no CNPJ)
-    linhas = [l.strip() for l in texto.split('\n') if l.strip()]
-    for i, linha in enumerate(linhas):
-        if dados["CNPJ"] and dados["CNPJ"] in linha:
-            # Opção A: O nome está na mesma linha, antes do CNPJ
-            texto_antes = linha.split(dados["CNPJ"])[0].strip()
-            texto_antes = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente)[\s:]*', '', texto_antes, flags=re.IGNORECASE).strip()
-            
-            if len(texto_antes) > 3 and not re.search(r'(?:CNPJ|CPF)', texto_antes, re.IGNORECASE):
-                dados["Fornecedor"] = texto_antes
-                break
-                
-            # Opção B: O nome está na linha de cima (muito comum)
-            if i > 0:
-                linha_cima = linhas[i-1]
-                linha_cima = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente)[\s:]*', '', linha_cima, flags=re.IGNORECASE).strip()
-                # Verifica se a linha de cima não é lixo público
-                if len(linha_cima) > 3 and not re.search(r'(?:Prefeitura|Município|Secretaria|Nota Fiscal)', linha_cima, re.IGNORECASE):
-                    dados["Fornecedor"] = linha_cima
-                    break
-
-    # Limpeza final de sujeiras no nome do fornecedor
-    if dados["Fornecedor"]:
-        dados["Fornecedor"] = re.sub(r'\s*(?:CNPJ|CPF|Inscrição|Endereço|Município|CEP).*', '', dados["Fornecedor"], flags=re.IGNORECASE).strip(" -:.,")
-
-    return dados
-
 def extrair_dados_pdf(conteudo_bytes):
-    """Tenta ler texto nativo. Se falhar, usa OCR."""
+    """Leitura profunda do PDF ancorada pelo CNPJ."""
+    dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
     texto_completo = ""
-    
-    # Tentativa 1: Leitura nativa rápida
+    linhas = []
+
     try:
         with pdfplumber.open(io.BytesIO(conteudo_bytes)) as pdf:
             for pagina in pdf.pages:
                 t = pagina.extract_text()
-                if t: texto_completo += t + "\n"
+                if t: 
+                    texto_completo += t + "\n"
+                    # Quebra mantendo a ordem original da leitura
+                    linhas.extend([l.strip() for l in t.split('\n') if l.strip()])
     except Exception:
-        pass
+        return dados # Se falhar ao abrir, retorna vazio
 
-    # Tentativa 2: OCR se o texto nativo for quase inexistente (Imagem escaneada)
-    if len(texto_completo.strip()) < 50:
-        try:
-            # Converte o PDF para imagens e passa o Tesseract
-            imagens = convert_from_bytes(conteudo_bytes, dpi=200)
-            for img in imagens:
-                # 'por' indica português
-                texto_completo += pytesseract.image_to_string(img, lang='por') + "\n"
-        except Exception as e:
-            # Ignora erros de OCR caso o servidor ainda não tenha instalado as dependências
-            pass
+    if not linhas:
+        return dados # PDF sem texto copiável (imagem)
 
-    return parse_texto_pdf(texto_completo)
+    # 1. CNPJ DO FORNECEDOR
+    # O primeiro CNPJ do documento em uma nota de serviço é invariavelmente o do Prestador
+    cnpjs = re.findall(r'\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b', texto_completo)
+    if cnpjs:
+        dados["CNPJ"] = cnpjs[0]
+
+    # 2. FORNECEDOR (Ancorado no CNPJ)
+    if dados["CNPJ"]:
+        for i, linha in enumerate(linhas):
+            if dados["CNPJ"] in linha:
+                # Estratégia A: O nome está na mesma linha, antes do CNPJ
+                texto_antes = linha.split(dados["CNPJ"])[0].strip()
+                texto_antes = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente|Nome)[\s:\-\.]*', '', texto_antes, flags=re.IGNORECASE).strip()
+                texto_antes = re.sub(r'(?:CNPJ|CPF)[\s:\-\.]*$', '', texto_antes, flags=re.IGNORECASE).strip()
+                
+                if texto_valido_para_fornecedor(texto_antes):
+                    dados["Fornecedor"] = texto_antes
+                    break
+                
+                # Estratégia B: O nome está na linha imediatamente ACIMA do CNPJ
+                if i > 0:
+                    linha_cima = linhas[i-1]
+                    linha_cima = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente|Nome)[\s:\-\.]*', '', linha_cima, flags=re.IGNORECASE).strip()
+                    if texto_valido_para_fornecedor(linha_cima):
+                        dados["Fornecedor"] = linha_cima
+                        break
+                        
+                # Estratégia C: O nome está duas linhas ACIMA do CNPJ (comum em tabelas quebradas)
+                if i > 1:
+                    linha_cima_dois = linhas[i-2]
+                    linha_cima_dois = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente|Nome)[\s:\-\.]*', '', linha_cima_dois, flags=re.IGNORECASE).strip()
+                    if texto_valido_para_fornecedor(linha_cima_dois):
+                        dados["Fornecedor"] = linha_cima_dois
+                        break
+
+    # 3. NÚMERO DA NOTA
+    # Procura estritamente por rótulos de número de nota perto do topo do documento
+    for linha in linhas[:30]: 
+        m = re.search(r'(?:N[UÚ]MERO|N[uú]mero da Nota|Nº|NF-e|NFS-e|Nota)[\s:\-\.]*0*(\d{1,15})\b', linha, re.IGNORECASE)
+        if m:
+            dados["Número da Nota"] = m.group(1)
+            break
+
+    # 4. VALOR
+    # Busca pela palavra "Total" ou "Líquido"
+    for linha in linhas:
+        m = re.search(r'(?:Total|Líquido|Liquido|Valor da Nota|Valor do Serviço)[\s:\-\.]*R?\$?\s*([\d\.]+(?:,\d{2}))', linha, re.IGNORECASE)
+        if m:
+            dados["Valor"] = m.group(1)
+            break
+    # Se não achou com rótulo, pega o último valor monetário do documento
+    if not dados["Valor"]:
+        valores = re.findall(r'R\$\s*([\d\.]+(?:,\d{2}))', texto_completo)
+        if valores:
+            dados["Valor"] = valores[-1]
+
+    # 5. DATA
+    m_data = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', texto_completo)
+    if m_data:
+        dados["Data"] = m_data.group(1)
+
+    return dados
 
 # --- PROCESSADOR INDIVIDUAL ---
 
@@ -155,8 +180,8 @@ def processar_arquivo(item):
 
 # --- INTERFACE DO STREAMLIT ---
 
-st.title("⚡ Extrator Exato de Notas Fiscais (XML / PDF + OCR)")
-st.write("Anexe arquivos soltos ou um arquivo **.ZIP** contendo as notas fiscais. **Aviso:** PDFs escaneados (imagens) levarão mais tempo devido ao processamento do OCR.")
+st.title("⚡ Extrator de Notas Fiscais (Leitura Profunda)")
+st.write("Anexe arquivos soltos ou um arquivo **.ZIP** contendo as notas fiscais. O sistema fará uma leitura cautelosa de cada arquivo.")
 
 arquivos_carregados = st.file_uploader(
     "Escolha os arquivos XML/PDF ou um arquivo ZIP", 
@@ -185,12 +210,13 @@ if arquivos_carregados:
     total_arquivos = len(lista_arquivos)
     
     if total_arquivos > 0:
-        st.info(f"Total de {total_arquivos} notas detectadas. Iniciando processamento...")
+        st.info(f"Total de {total_arquivos} notas detectadas. Iniciando processamento cuidadoso...")
         
         barra_progresso = st.progress(0)
         resultados = []
-        # O Streamlit Cloud tem limite de processamento. Mantemos threads altas, mas o OCR limitará a velocidade.
-        max_workers = min(32, (os.cpu_count() or 4) * 4) 
+        
+        # Reduzido o número de processos paralelos para garantir estabilidade na leitura profunda
+        max_workers = min(10, (os.cpu_count() or 2) * 2) 
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for i, resultado in enumerate(executor.map(processar_arquivo, lista_arquivos)):
