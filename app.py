@@ -10,9 +10,27 @@ import os
 
 st.set_page_config(page_title="Extrator de Notas Fiscais", layout="wide")
 
-# --- FUNÇÕES DE EXTRAÇÃO (REGEX E XML) ---
+# --- FUNÇÕES AUXILIARES DE SUPORTE ---
 
-def extrair_dados_xml(conteudo_bytes):
+def extrair_numero_do_nome_arquivo(nome_arquivo):
+    """Tenta extrair o número da nota a partir do nome do arquivo caso falhe no texto."""
+    # Remove extensões
+    nome_limpo = os.path.splitext(nome_arquivo)[0]
+    # Procura por sequências de números isolados ou após prefixos comuns
+    match = re.search(r'(?:NF|NF-e|NFS-e|NOTA|Nº)?\s*[_ \-]*(\d+)', nome_limpo, re.IGNORECASE)
+    if match and len(match.group(1)) <= 9: # Notas fiscais geralmente têm até 9 dígitos
+        return match.group(1)
+    # Se não bater no padrão acima, pega o maior grupo de números puro encontrado
+    numeros = re.findall(r'\d+', nome_limpo)
+    if numeros:
+        maior_num = max(numeros, key=len)
+        if len(maior_num) <= 9:
+            return maior_num
+    return ""
+
+# --- FUNÇÕES DE EXTRAÇÃO DE DADOS ---
+
+def extrair_dados_xml(conteudo_bytes, nome_arquivo):
     """Extrai dados de um XML de NF-e/NFS-e padrão."""
     try:
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
@@ -26,39 +44,33 @@ def extrair_dados_xml(conteudo_bytes):
                     return el.text.strip()
             return ""
 
-        numero = buscar_tag(['nNF', 'Numero', 'numeroNota', 'nNFse'])
+        numero = buscar_tag(['nNF', 'Numero', 'numeroNota', 'nNFse', 'numNota'])
         cnpj = buscar_tag(['CNPJ', 'Cnpj', 'cnpjPrestador', 'cnpjEmitente', 'chNFe'])
-        razao_social = buscar_tag(['xNome', 'RazaoSocial', 'nomePrestador', 'nomeEmitente', 'xFant'])
-        valor = buscar_tag(['vNF', 'ValorServicos', 'valorLiquido', 'vProd', 'vBC'])
-        data = buscar_tag(['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi', 'dhCompetencia'])
+        fornecedor = buscar_tag(['xNome', 'RazaoSocial', 'nomePrestador', 'nomeEmitente', 'xFant'])
+        valor = buscar_tag(['vNF', 'ValorServicos', 'valorLiquido', 'vProd', 'vBC', 'vLiq'])
+        data = buscar_tag(['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi', 'dhCompetencia', 'dtEmi'])
         
         if data and len(data) >= 10:
             data = data[:10]
 
-        # Tratamento caso o CNPJ venha dentro da chave de acesso (chNFe)
         if cnpj and len(cnpj) == 44:
             cnpj = cnpj[6:20]
 
-        return {
-            "Número da Nota": numero if numero else "Não encontrado",
-            "Razão Social": razao_social if razao_social else "Não encontrado",
-            "CNPJ": cnpj if cnpj else "Não encontrado",
-            "Valor": valor if valor else "Não encontrado",
-            "Data": data if data else "Não encontrado",
-            "Fornecedor": razao_social if razao_social else "Não encontrado"
-        }
-    except Exception as e:
-        return {
-            "Número da Nota": "Erro no XML",
-            "Razão Social": "Erro de Leitura",
-            "CNPJ": "Erro de Leitura",
-            "Valor": "",
-            "Data": "",
-            "Fornecedor": f"Erro: {str(e)[:20]}"
-        }
+        if not numero or numero == "0":
+            numero = extrair_numero_do_nome_arquivo(nome_arquivo)
 
-def extrair_dados_pdf(conteudo_bytes):
-    """Extrai dados de um PDF usando Expressões Regulares mais abrangentes."""
+        return {
+            "Número da Nota": numero if numero else "Não identificado",
+            "CNPJ": cnpj if cnpj else "Não identificado",
+            "Valor": valor if valor else "0,00",
+            "Data": data if data else "Não identificada",
+            "Fornecedor": fornecedor if fornecedor else "Não identificado"
+        }
+    except Exception:
+        return None
+
+def extrair_dados_pdf(conteudo_bytes, nome_arquivo):
+    """Extrai dados de um PDF usando padrões Regex Avançados e Hierárquicos."""
     try:
         pdf = PdfReader(io.BytesIO(conteudo_bytes))
         texto = ""
@@ -67,52 +79,82 @@ def extrair_dados_pdf(conteudo_bytes):
             
         if not texto.strip():
             return {
-                "Número da Nota": "PDF sem texto (Imagem)",
-                "Razão Social": "Requer OCR",
+                "Número da Nota": extrair_numero_do_nome_arquivo(nome_arquivo) or "PDF Sem Texto (Imagem)",
                 "CNPJ": "Requer OCR",
-                "Valor": "",
-                "Data": "",
+                "Valor": "0,00",
+                "Data": "Requer OCR",
                 "Fornecedor": "PDF Escaneado"
             }
 
-        # Regex aprimorados e mais tolerantes a espaços e quebras de linha
-        numero_match = re.search(r'(?:NÚMERO|NUMERO|Nº|Nota Nº|Nota:)\s*[:.]?\s*(\d+)', texto, re.IGNORECASE)
+        # 1. Busca Avançada de Número da Nota
+        numero = ""
+        padroes_numero = [
+            r'(?:NÚMERO|NUMERO|Nº|Nota Nº|Nota Fiscal Eletrônica|NFS-e|NF-e)\s*[:.]?\s*(\d+)',
+            r'(?:Nº\s*DA\s*NOTA|NÚMERO\s*DA\s*NOTA)\s*[:.]?\s*(\d+)',
+            r'(?:Fatura|Duplicata|Sequência)\s*[:.]?\s*(\d+)',
+            r'\b\d{1,9}\b' # Procura por qualquer número isolado de tamanho compatível se falhar
+        ]
+        for padrao in padroes_numero:
+            match = re.search(padrao, texto, re.IGNORECASE)
+            if match and match.group(1) and match.group(1) != "0":
+                numero = match.group(1)
+                break
+        
+        if not numero or numero == "0":
+            numero = extrair_numero_do_nome_arquivo(nome_arquivo)
+
+        # 2. Busca de CNPJ
         cnpj_match = re.search(r'(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{14})', texto)
-        
-        # Captura valores com pontuação brasileira (ex: 2.485.739,00 ou 933,33)
-        valor_match = re.search(r'(?:VALOR TOTAL|VALOR LÍQUIDO|VALOR LIQUIDO|TOTAL DA NOTA|R\$)\s*[:.]?\s*([\d.,]+)', texto, re.IGNORECASE)
-        if not valor_match:
-            # Busca secundária por qualquer formato monetário comum se o principal falhar
-            valor_match = re.search(r'R\$\s*([\d.,]+)', texto)
-
-        data_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', texto)
-        razao_match = re.search(r'(?:Razão Social|Razao Social|Prestador|Emitente|Nome/Razão Social)\s*[:.]?\s*([^\n\t]+)', texto, re.IGNORECASE)
-
-        numero = numero_match.group(1) if numero_match else "Não encontrado"
         cnpj = cnpj_match.group(1) if cnpj_match else "Não encontrado"
-        valor = valor_match.group(1) if valor_match else "Não encontrado"
-        data = data_match.group(1) if data_match else "Não encontrado"
+
+        # 3. Busca de Valor Monetário
+        valor_match = re.search(r'(?:VALOR TOTAL|VALOR LÍQUIDO|VALOR LIQUIDO|TOTAL DA NOTA|R\$)\s*[:.]?\s*([\d.,]+)', texto, re.IGNORECASE)
+        valor = valor_match.group(1) if valor_match else ""
+        if not valor:
+            valores_encontrados = re.findall(r'R\$\s*([\d.,]+)', texto)
+            if valores_encontrados:
+                valor = valores_encontrados[-1] # Geralmente o total fica no final do documento
+        if not valor:
+            valor = "Verificar no PDF"
+
+        # 4. Busca de Data
+        data_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', texto)
+        data = data_match.group(1) if data_match else "Não encontrada"
+
+        # 5. Busca do Fornecedor (Nome/Razão Social)
+        fornecedor = ""
+        padroes_fornecedor = [
+            r'(?:Razão Social|Razao Social|Prestador de Serviços|Prestador|Emitente|Nome/Razão Social)\s*[:.]?\s*([^\n\t\:]+)',
+            r'(?:Razão Social\s*Do\s*Prestador)\s*[:.]?\s*([^\n\t\:]+)'
+        ]
+        for padrao in padroes_fornecedor:
+            match = re.search(padrao, texto, re.IGNORECASE)
+            if match and len(match.group(1).strip()) > 3:
+                fornecedor = match.group(1).strip()
+                break
         
-        razao_social = razao_match.group(1).strip() if razao_match else ""
-        if not razao_social or len(razao_social) < 3:
-            razao_social = "Verificar no PDF"
+        if not fornecedor or "verificar" in fornecedor.lower() or len(fornecedor) < 3:
+            # Pega a primeira linha de texto significativa caso os padrões falhem (comum em topos de NFS-e)
+            linhas = [l.strip() for l in texto.split('\n') if len(l.strip()) > 5]
+            fornecedor = linhas[0] if linhas else "Verificar no PDF"
+
+        # Limpezas básicas no nome do fornecedor para remover restos de texto
+        fornecedor = re.sub(r'(CNPJ|Inscrição|Telefone|Endereço).*$', '', fornecedor, flags=re.IGNORECASE).strip()
 
         return {
-            "Número da Nota": numero,
-            "Razão Social": razao_social,
+            "Número da Nota": numero if numero else "Não identificado",
             "CNPJ": cnpj,
             "Valor": valor,
             "Data": data,
-            "Fornecedor": razao_social
+            "Fornecedor": fornecedor
         }
-    except Exception as e:
+    except Exception:
         return {
-            "Número da Nota": "Erro no PDF",
-            "Razão Social": "Erro de Leitura",
-            "CNPJ": "Erro de Leitura",
-            "Valor": "",
-            "Data": "",
-            "Fornecedor": f"Erro: {str(e)[:20]}"
+            "Número da Nota": extrair_numero_do_nome_arquivo(nome_arquivo) or "Erro de Leitura",
+            "CNPJ": "Erro",
+            "Valor": "0,00",
+            "Data": "Erro",
+            "Fornecedor": "Falha ao processar estrutura"
         }
 
 # --- PROCESSADOR INDIVIDUAL ---
@@ -124,18 +166,16 @@ def processar_arquivo(item):
     
     dados = None
     if nome_lower.endswith('.xml'):
-        dados = extrair_dados_xml(conteudo)
+        dados = extrair_dados_xml(conteudo, nome_arquivo)
     elif nome_lower.endswith('.pdf'):
-        dados = extrair_dados_pdf(conteudo)
+        dados = extrair_dados_pdf(conteudo, nome_arquivo)
         
-    # Se por qualquer motivo retornar vazio, criamos uma linha padrão para não perder o arquivo da contagem
     if not dados:
         dados = {
-            "Número da Nota": "Não suportado",
-            "Razão Social": "Formato inválido",
+            "Número da Nota": extrair_numero_do_nome_arquivo(nome_arquivo) or "Não identificado",
             "CNPJ": "Formato inválido",
-            "Valor": "",
-            "Data": "",
+            "Valor": "0,00",
+            "Data": "Incompatível",
             "Fornecedor": "Não identificado"
         }
         
@@ -188,18 +228,20 @@ if arquivos_carregados:
         if resultados:
             df = pd.DataFrame(resultados)
             
-            colunas_ordem = ["Número da Nota", "Razão Social", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
+            # Colunas unificadas (sem Razão Social duplicada)
+            colunas_ordem = ["Número da Nota", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
             for col in colunas_ordem:
                 if col not in df.columns:
                     df[col] = ""
             df = df[colunas_ordem]
             
-            # Alerta visual caso o total mapeado seja diferente do esperado para auditoria rápida
-            st.success(f"Sucesso! {len(df)} linhas geradas para as {total_arquivos} notas encontradas.")
+            st.success(f"Sucesso! {len(df)} de {total_arquivos} linhas geradas.")
             
+            # Pré-visualização da Tabela
             st.subheader("📋 Pré-visualização dos Dados")
             st.dataframe(df, use_container_width=True)
             
+            # Geração do Excel para Download
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Notas Fiscais')
