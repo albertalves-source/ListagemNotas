@@ -17,10 +17,9 @@ def extrair_dados_xml(conteudo_bytes):
     try:
         # Remove namespaces para facilitar a busca por tags
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
-        xml_str = re.sub(r'xmlns="[^"]"', '', xml_str)
+        xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str)  # Corrigido regex de namespace
         root = ET.fromstring(xml_str)
         
-        # Como o XML pode variar por município/estado, usamos caminhos flexíveis (.//)
         def buscar_tag(tags):
             for tag in tags:
                 el = root.find(f".//{tag}")
@@ -34,7 +33,6 @@ def extrair_dados_xml(conteudo_bytes):
         valor = buscar_tag(['vNF', 'ValorServicos', 'valorLiquido', 'vProd'])
         data = buscar_tag(['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi'])
         
-        # Limpeza simples da data (pega apenas AAAA-MM-DD se houver hora)
         if data and len(data) >= 10:
             data = data[:10]
 
@@ -44,7 +42,7 @@ def extrair_dados_xml(conteudo_bytes):
             "CNPJ": cnpj,
             "Valor": valor,
             "Data": data,
-            "Fornecedor": razao_social # Geralmente o emitente é o fornecedor
+            "Fornecedor": razao_social
         }
     except Exception:
         return None
@@ -60,14 +58,10 @@ def extrair_dados_pdf(conteudo_bytes):
         if not texto:
             return None
 
-        # Padrões Regex (Podem precisar de ajustes dependendo do layout do seu fornecedor)
-        # Nota: PDFs não têm padrão fixo como XML, estes regex pegam formatos comuns
         numero_match = re.search(r'(?:NÚMERO|NUMERO|Nº|Nota Nº)\s*[:.]?\s*(\d+)', texto, re.IGNORECASE)
         cnpj_match = re.search(r'(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{14})', texto)
         valor_match = re.search(r'(?:VALOR TOTAL|VALOR LIQUIDO|TOTAL DA NOTA|R\$)\s*[:.]?\s*([\d.,]+)', texto, re.IGNORECASE)
         data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto)
-        
-        # Tentativa de pegar Razão Social (geralmente próxima ao CNPJ ou no topo)
         razao_match = re.search(r'(?:Razão Social|Razao Social|Prestador|Emitente)\s*[:.]?\s*([A-Za-z0-9 ]+)', texto, re.IGNORECASE)
 
         numero = numero_match.group(1) if numero_match else ""
@@ -110,11 +104,10 @@ def processar_arquivo(item):
 st.title("⚡ Extrator Ultrarápido de Notas Fiscais (XML / PDF)")
 st.write("Anexe arquivos soltos ou um arquivo **.ZIP** contendo até milhares de notas fiscais.")
 
-# Aceita múltiplos arquivos ou um arquivo ZIP
+# Removido o parâmetro obsoleto 'allow_output_mutation' que causava o TypeError
 arquivos_carregados = st.file_uploader(
     "Escolha os arquivos XML/PDF ou um arquivo ZIP", 
     type=["xml", "pdf", "zip"], 
-    allow_output_mutation=False, 
     accept_multiple_files=True
 )
 
@@ -126,10 +119,14 @@ if arquivos_carregados:
         for arq in arquivos_carregados:
             if arq.name.lower().endswith('.zip'):
                 try:
-                    with zipfile.ZipFile(io.BytesIO(arq.read())) as z:
+                    # Lê os bytes do zip de forma limpa
+                    zip_data = arq.read()
+                    with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
                         for nome_interno in z.namelist():
                             if nome_interno.lower().endswith(('.xml', '.pdf')):
-                                lista_arquivos.append((nome_interno, z.read(nome_interno)))
+                                # Evita arquivos temporários ocultos de sistemas operacionais (como __MACOSX)
+                                if not nome_interno.startswith('__MACOSX') and not os.path.basename(nome_interno).startswith('.'):
+                                    lista_arquivos.append((nome_interno, z.read(nome_interno)))
                 except Exception as e:
                     st.error(f"Erro ao ler o arquivo ZIP {arq.name}: {e}")
             else:
@@ -143,25 +140,25 @@ if arquivos_carregados:
         # Progress bar
         barra_progresso = st.progress(0)
         
-        # 2. Processamento Paralelo utilizando Threads para alta velocidade (I/O bound)
+        # 2. Processamento Paralelo utilizando Threads para alta velocidade
         resultados = []
-        # O Streamlit Cloud tem limites de CPU, usar min(32, total) aproveita o máximo sem estourar a máquina
-        max_workers = min(32, os.cpu_count() * 4 or 16) 
+        max_workers = min(32, (os.cpu_count() or 4) * 4) 
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Mapeia a função para a lista de arquivos
             for i, resultado in enumerate(executor.map(processar_arquivo, lista_arquivos)):
                 if resultado:
                     resultados.append(resultado)
-                # Atualiza a barra de progresso dinamicamente
                 barra_progresso.progress((i + 1) / total_arquivos)
 
         # 3. Exibição dos resultados
         if resultados:
             df = pd.DataFrame(resultados)
             
-            # Reorganiza colunas
+            # Garante que todas as colunas pedidas existam na ordem correta
             colunas_ordem = ["Número da Nota", "Razão Social", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
+            for col in colunas_ordem:
+                if col Republican not in df.columns:
+                    df[col] = ""
             df = df[colunas_ordem]
             
             st.success(f"Sucesso! {len(resultados)} notas processadas com êxito.")
