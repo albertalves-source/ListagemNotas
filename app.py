@@ -11,7 +11,13 @@ import re
 import google.generativeai as genai
 from pdf2image import convert_from_bytes
 
-st.set_page_config(page_title="Extrator de Notas Fiscais (IA Robusta)", layout="wide")
+st.set_page_config(page_title="Extrator de Notas Fiscais (IA + Memória)", layout="wide")
+
+# --- MEMÓRIA DO APLICATIVO (Evita perder dados se a tela piscar) ---
+if "resultados_salvos" not in st.session_state:
+    st.session_state.resultados_salvos = []
+if "arquivos_processados" not in st.session_state:
+    st.session_state.arquivos_processados = set()
 
 # --- CONFIGURAÇÃO DA IA ---
 CHAVE_API = st.secrets.get("GEMINI_API_KEY", "")
@@ -20,9 +26,8 @@ if CHAVE_API:
     genai.configure(api_key=CHAVE_API)
     modelo_ia = genai.GenerativeModel('gemini-2.5-flash')
 
-# --- FUNÇÃO DA INTELIGÊNCIA ARTIFICIAL COM AUTO-RETRY ---
+# --- FUNÇÃO DA IA ---
 def extrair_dados_com_ia(conteudo_extra):
-    """Envia o texto ou a IMAGEM da nota para a IA analisar, com sistema anti-bloqueio."""
     prompt = """
     Você é um assistente especialista em contabilidade. Analise o conteúdo fornecido desta nota fiscal e extraia os dados abaixo.
     Retorne ESTRITAMENTE um JSON válido com estas chaves exatas (e nada mais):
@@ -54,16 +59,13 @@ def extrair_dados_com_ia(conteudo_extra):
             
         except Exception as e:
             erro_str = str(e).lower()
-            # Se o erro for de limite de API (429), espera 15s e tenta novamente
             if "429" in erro_str or "exhausted" in erro_str or "quota" in erro_str:
                 if tentativa < tentativas - 1:
                     time.sleep(15) 
                     continue
-            
-            # Se for outro erro ou acabaram as tentativas
             return {"Número da Nota": "Erro", "CNPJ": "Erro", "Valor": "Erro", "Data": "Erro", "Fornecedor": f"Falha IA: {str(e)[:40]}"}
             
-    return {"Número da Nota": "Erro", "CNPJ": "Erro", "Valor": "Erro", "Data": "Erro", "Fornecedor": "Limite de API excedido após retentativas"}
+    return {"Número da Nota": "Erro", "CNPJ": "Erro", "Valor": "Erro", "Data": "Erro", "Fornecedor": "Limite de API excedido"}
 
 # --- EXTRAÇÃO DE ARQUIVOS ---
 def extrair_dados_xml(conteudo_bytes):
@@ -115,21 +117,18 @@ def processar_arquivo(item):
         except Exception:
             pass
             
-        # Se tem texto normal, manda o texto pra IA
         if len(texto_pdf.strip()) > 50:
             dados = extrair_dados_com_ia(texto_pdf)
         else:
-            # SE FOR IMAGEM ESCANEADA: Tira "foto" do PDF e manda pra IA Visão
             try:
                 imagens = convert_from_bytes(conteudo, dpi=150)
                 if imagens:
                     dados = extrair_dados_com_ia(imagens[0])
                 else:
-                    dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "PDF Vazio/Corrompido"}
-            except Exception as e:
-                dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "Erro de OCR (Instale o poppler-utils)"}
+                    dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "PDF Vazio"}
+            except Exception:
+                dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "Erro de Leitura de Imagem"}
                 
-        # Pausa padrão obrigatória
         time.sleep(4.5)
         
     if not dados:
@@ -138,15 +137,22 @@ def processar_arquivo(item):
     dados["Arquivo"] = os.path.basename(nome_arquivo)
     
     chaves_corretas = ["Número da Nota", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
-    dados_finais = {k: dados.get(k, "") for k in chaves_corretas}
-    return dados_finais
+    return {k: dados.get(k, "") for k in chaves_corretas}
 
 # --- INTERFACE DO STREAMLIT ---
-st.title("🧠 Extrator de Notas Fiscais Inteligente (Visão + Anti-Bloqueio)")
-st.write("A IA lê texto, analisa PDFs escaneados como imagem e lida automaticamente com limites da API.")
+st.title("🧠 Extrator de Notas Fiscais Inteligente")
+st.warning("⚠️ **Dica Importante:** Para evitar que o servidor reinicie, envie lotes de no máximo **50 a 100 notas por vez**.")
 
 if not CHAVE_API:
-    st.error("⚠️ Atenção: A chave da API do Gemini não foi detectada. Verifique os Secrets do Streamlit Cloud.")
+    st.error("⚠️ Atenção: A chave da API do Gemini não foi detectada.")
+
+# Botão para limpar a memória caso o usuário queira começar um lote novo do zero
+if st.sidebar.button("🗑️ Limpar Memória e Começar de Novo"):
+    st.session_state.resultados_salvos = []
+    st.session_state.arquivos_processados = set()
+    st.rerun()
+
+st.sidebar.info(f"Notas na Memória Atual: **{len(st.session_state.resultados_salvos)}**")
 
 arquivos_carregados = st.file_uploader(
     "Escolha os arquivos XML/PDF ou um arquivo ZIP", 
@@ -167,36 +173,55 @@ if arquivos_carregados and CHAVE_API:
                             if nome_interno.lower().endswith(('.xml', '.pdf')):
                                 if not nome_interno.startswith('__MACOSX') and not os.path.basename(nome_interno).startswith('.'):
                                     lista_arquivos.append((nome_interno, z.read(nome_interno)))
-                except Exception as e:
-                    st.error(f"Erro ao ler ZIP: {e}")
+                except Exception:
+                    pass
             else:
                 lista_arquivos.append((arq.name, arq.read()))
 
     total_arquivos = len(lista_arquivos)
     
     if total_arquivos > 0:
-        tempo_estimado_min = (total_arquivos * 5) / 60
-        st.info(f"Processando {total_arquivos} notas. Se a API atingir o limite, o sistema aguardará 15s automaticamente. Tempo estimado: ~{tempo_estimado_min:.1f} minutos.")
+        arquivos_pendentes = [arq for arq in lista_arquivos if arq[0] not in st.session_state.arquivos_processados]
         
-        barra_progresso = st.progress(0)
-        resultados = []
-        
-        for i, item in enumerate(lista_arquivos):
-            resultado = processar_arquivo(item)
-            resultados.append(resultado)
-            barra_progresso.progress((i + 1) / total_arquivos)
-
-        if resultados:
-            df = pd.DataFrame(resultados)
+        if arquivos_pendentes:
+            st.info(f"Processando {len(arquivos_pendentes)} novas notas...")
+            barra_progresso = st.progress(0)
             
+            # Espaço reservado para mostrar a tabela crescendo ao vivo
+            tabela_placeholder = st.empty()
+            
+            for i, item in enumerate(arquivos_pendentes):
+                resultado = processar_arquivo(item)
+                
+                # Salva na memória instantaneamente
+                st.session_state.resultados_salvos.append(resultado)
+                st.session_state.arquivos_processados.add(item[0])
+                
+                # Atualiza a tela a cada nota processada
+                df_parcial = pd.DataFrame(st.session_state.resultados_salvos)
+                colunas_ordem = ["Número da Nota", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
+                df_parcial = df_parcial[colunas_ordem]
+                tabela_placeholder.dataframe(df_parcial, use_container_width=True)
+                
+                barra_progresso.progress((i + 1) / len(arquivos_pendentes))
+                
             st.success("Leitura concluída!")
+        else:
+            st.success("Todas as notas deste lote já estão na memória.")
             
-            st.subheader("📋 Pré-visualização dos Dados")
-            st.dataframe(df, use_container_width=True)
+        # Exibe o botão de Download com base no que está na memória
+        if st.session_state.resultados_salvos:
+            df_final = pd.DataFrame(st.session_state.resultados_salvos)
+            colunas_ordem = ["Número da Nota", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
+            df_final = df_final[colunas_ordem]
+            
+            if not arquivos_pendentes:
+                st.subheader("📋 Dados Prontos")
+                st.dataframe(df_final, use_container_width=True)
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Notas Fiscais')
+                df_final.to_excel(writer, index=False, sheet_name='Notas Fiscais')
             dados_excel = output.getvalue()
             
             st.download_button(
