@@ -17,7 +17,8 @@ CHAVE_API = st.secrets.get("GEMINI_API_KEY", "")
 
 if CHAVE_API:
     genai.configure(api_key=CHAVE_API)
-    modelo_ia = genai.GenerativeModel('models/gemini-1.5-flash-latest')
+    # ATUALIZADO: Usando a versão 2.5 atual do Google Gemini
+    modelo_ia = genai.GenerativeModel('gemini-2.5-flash')
 
 # --- FUNÇÃO DA INTELIGÊNCIA ARTIFICIAL ---
 def extrair_dados_com_ia(texto_nota):
@@ -39,7 +40,7 @@ def extrair_dados_com_ia(texto_nota):
     """
     
     try:
-        # Força o retorno estrito em JSON (requer versões recentes do google-generativeai)
+        # Força o retorno estrito em JSON
         resposta = modelo_ia.generate_content(
             prompt,
             generation_config=genai.GenerationConfig(response_mime_type="application/json")
@@ -57,7 +58,6 @@ def extrair_dados_com_ia(texto_nota):
         return dados_json
         
     except Exception as e:
-        # AGORA O ERRO É MOSTRADO, NÃO MAIS OCULTADO
         return {
             "Número da Nota": "Erro", 
             "CNPJ": "Erro", 
@@ -122,7 +122,7 @@ def processar_arquivo(item):
             if texto_pdf.strip():
                 # Passa para a IA ler
                 dados = extrair_dados_com_ia(texto_pdf)
-                # PAUSA OBRIGATÓRIA DE 4.2 SEGUNDOS PARA NÃO BLOQUEAR A API DO GOOGLE (15/min)
+                # Pausa obrigatória para não ser bloqueado pela API gratuita
                 time.sleep(4.2)
             else:
                 dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "PDF sem texto (Imagem escaneada)"}
@@ -132,7 +132,6 @@ def processar_arquivo(item):
         
     dados["Arquivo"] = os.path.basename(nome_arquivo)
     
-    # Garante a formatação final das chaves para evitar erros no Pandas
     chaves_corretas = ["Número da Nota", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
     dados_finais = {k: dados.get(k, "") for k in chaves_corretas}
     return dados_finais
@@ -171,15 +170,12 @@ if arquivos_carregados and CHAVE_API:
     total_arquivos = len(lista_arquivos)
     
     if total_arquivos > 0:
-        # Previsão de tempo para tranquilizar o usuário
         tempo_estimado_min = (total_arquivos * 4.2) / 60
         st.info(f"Total de {total_arquivos} notas. Tempo estimado da IA: ~{tempo_estimado_min:.1f} minutos. Deixe a página aberta!")
         
         barra_progresso = st.progress(0)
         resultados = []
         
-        # O processamento agora é intencionalmente sequencial (sem ThreadPoolExecutor) 
-        # para garantir que a API do Google não receba conexões paralelas que resultem em bloqueio.
         for i, item in enumerate(lista_arquivos):
             resultado = processar_arquivo(item)
             resultados.append(resultado)
