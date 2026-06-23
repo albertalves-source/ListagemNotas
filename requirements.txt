@@ -3,6 +3,6 @@ pandas
 pypdf
 pdfplumber
 openpyxl
-tesseract-ocr
-tesseract-ocr-por
-poppler-utils
+pytesseract
+pdf2image
+Pillow
