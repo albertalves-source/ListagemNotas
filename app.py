@@ -9,24 +9,24 @@ import json
 import time
 import re
 import google.generativeai as genai
+from pdf2image import convert_from_bytes
 
-st.set_page_config(page_title="Extrator de Notas Fiscais (IA Inteligente)", layout="wide")
+st.set_page_config(page_title="Extrator de Notas Fiscais (IA Robusta)", layout="wide")
 
 # --- CONFIGURAÇÃO DA IA ---
 CHAVE_API = st.secrets.get("GEMINI_API_KEY", "")
 
 if CHAVE_API:
     genai.configure(api_key=CHAVE_API)
-    # ATUALIZADO: Usando a versão 2.5 atual do Google Gemini
     modelo_ia = genai.GenerativeModel('gemini-2.5-flash')
 
-# --- FUNÇÃO DA INTELIGÊNCIA ARTIFICIAL ---
-def extrair_dados_com_ia(texto_nota):
-    """Envia o texto da nota para a IA analisar o contexto de forma estruturada."""
-    prompt = f"""
-    Você é um assistente especialista em contabilidade. Analise o texto desta nota fiscal e extraia os dados abaixo.
+# --- FUNÇÃO DA INTELIGÊNCIA ARTIFICIAL COM AUTO-RETRY ---
+def extrair_dados_com_ia(conteudo_extra):
+    """Envia o texto ou a IMAGEM da nota para a IA analisar, com sistema anti-bloqueio."""
+    prompt = """
+    Você é um assistente especialista em contabilidade. Analise o conteúdo fornecido desta nota fiscal e extraia os dados abaixo.
     Retorne ESTRITAMENTE um JSON válido com estas chaves exatas (e nada mais):
-    {{"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}}
+    {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
 
     Regras:
     - Fornecedor: É o Prestador de Serviços ou Emitente. Ignore nomes de prefeituras, municípios ou do tomador.
@@ -34,41 +34,39 @@ def extrair_dados_com_ia(texto_nota):
     - Data: Formato DD/MM/AAAA.
     - Valor: O valor total ou líquido do serviço (apenas o número e a vírgula).
     Se não encontrar a informação, deixe a string vazia "".
-
-    Texto da Nota:
-    {texto_nota}
     """
     
-    try:
-        # Força o retorno estrito em JSON
-        resposta = modelo_ia.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(response_mime_type="application/json")
-        )
-        
-        texto_resposta = resposta.text.strip()
-        
-        # Limpeza de segurança caso a IA ainda retorne blocos markdown
-        if texto_resposta.startswith("```"):
-            match = re.search(r'\{.*\}', texto_resposta, re.DOTALL)
-            if match:
-                texto_resposta = match.group(0)
-                
-        dados_json = json.loads(texto_resposta)
-        return dados_json
-        
-    except Exception as e:
-        return {
-            "Número da Nota": "Erro", 
-            "CNPJ": "Erro", 
-            "Valor": "Erro", 
-            "Data": "Erro", 
-            "Fornecedor": f"Erro na IA: {str(e)[:50]}"
-        }
+    tentativas = 4
+    for tentativa in range(tentativas):
+        try:
+            resposta = modelo_ia.generate_content(
+                [prompt, conteudo_extra],
+                generation_config=genai.GenerationConfig(response_mime_type="application/json")
+            )
+            
+            texto_resposta = resposta.text.strip()
+            if texto_resposta.startswith("```"):
+                match = re.search(r'\{.*\}', texto_resposta, re.DOTALL)
+                if match:
+                    texto_resposta = match.group(0)
+                    
+            return json.loads(texto_resposta)
+            
+        except Exception as e:
+            erro_str = str(e).lower()
+            # Se o erro for de limite de API (429), espera 15s e tenta novamente
+            if "429" in erro_str or "exhausted" in erro_str or "quota" in erro_str:
+                if tentativa < tentativas - 1:
+                    time.sleep(15) 
+                    continue
+            
+            # Se for outro erro ou acabaram as tentativas
+            return {"Número da Nota": "Erro", "CNPJ": "Erro", "Valor": "Erro", "Data": "Erro", "Fornecedor": f"Falha IA: {str(e)[:40]}"}
+            
+    return {"Número da Nota": "Erro", "CNPJ": "Erro", "Valor": "Erro", "Data": "Erro", "Fornecedor": "Limite de API excedido após retentativas"}
 
 # --- EXTRAÇÃO DE ARQUIVOS ---
 def extrair_dados_xml(conteudo_bytes):
-    """Extração pura para arquivos XML."""
     dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
     try:
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
@@ -101,7 +99,6 @@ def extrair_dados_xml(conteudo_bytes):
     return dados
 
 def processar_arquivo(item):
-    """Lê o arquivo de forma linear e aciona a IA com limite de tempo."""
     nome_arquivo, conteudo = item
     nome_lower = nome_arquivo.lower()
     
@@ -115,17 +112,25 @@ def processar_arquivo(item):
                 for pagina in pdf.pages:
                     t = pagina.extract_text()
                     if t: texto_pdf += t + "\n"
-        except Exception as e:
-            dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": f"PDF corrompido: {str(e)[:30]}"}
+        except Exception:
+            pass
             
-        if dados is None: # Se não falhou ao abrir
-            if texto_pdf.strip():
-                # Passa para a IA ler
-                dados = extrair_dados_com_ia(texto_pdf)
-                # Pausa obrigatória para não ser bloqueado pela API gratuita
-                time.sleep(4.2)
-            else:
-                dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "PDF sem texto (Imagem escaneada)"}
+        # Se tem texto normal, manda o texto pra IA
+        if len(texto_pdf.strip()) > 50:
+            dados = extrair_dados_com_ia(texto_pdf)
+        else:
+            # SE FOR IMAGEM ESCANEADA: Tira "foto" do PDF e manda pra IA Visão
+            try:
+                imagens = convert_from_bytes(conteudo, dpi=150)
+                if imagens:
+                    dados = extrair_dados_com_ia(imagens[0])
+                else:
+                    dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "PDF Vazio/Corrompido"}
+            except Exception as e:
+                dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "Erro de OCR (Instale o poppler-utils)"}
+                
+        # Pausa padrão obrigatória
+        time.sleep(4.5)
         
     if not dados:
         dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": "Formato desconhecido"}
@@ -137,8 +142,8 @@ def processar_arquivo(item):
     return dados_finais
 
 # --- INTERFACE DO STREAMLIT ---
-st.title("🧠 Extrator de Notas Fiscais Inteligente (Com IA)")
-st.write("Leitura nota por nota, com pausas programadas para evitar o bloqueio da Inteligência Artificial.")
+st.title("🧠 Extrator de Notas Fiscais Inteligente (Visão + Anti-Bloqueio)")
+st.write("A IA lê texto, analisa PDFs escaneados como imagem e lida automaticamente com limites da API.")
 
 if not CHAVE_API:
     st.error("⚠️ Atenção: A chave da API do Gemini não foi detectada. Verifique os Secrets do Streamlit Cloud.")
@@ -170,8 +175,8 @@ if arquivos_carregados and CHAVE_API:
     total_arquivos = len(lista_arquivos)
     
     if total_arquivos > 0:
-        tempo_estimado_min = (total_arquivos * 4.2) / 60
-        st.info(f"Total de {total_arquivos} notas. Tempo estimado da IA: ~{tempo_estimado_min:.1f} minutos. Deixe a página aberta!")
+        tempo_estimado_min = (total_arquivos * 5) / 60
+        st.info(f"Processando {total_arquivos} notas. Se a API atingir o limite, o sistema aguardará 15s automaticamente. Tempo estimado: ~{tempo_estimado_min:.1f} minutos.")
         
         barra_progresso = st.progress(0)
         resultados = []
