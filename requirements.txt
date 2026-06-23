@@ -4,3 +4,5 @@ pypdf
 pdfplumber
 openpyxl
 google-generativeai>=0.7.0
+pdf2image
+Pillow
