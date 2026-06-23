@@ -15,7 +15,6 @@ st.set_page_config(page_title="Extrator de Notas Fiscais", layout="wide")
 def extrair_dados_xml(conteudo_bytes):
     """Extrai dados de um XML de NF-e/NFS-e padrão."""
     try:
-        # Remove namespaces para facilitar a busca por tags
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
         xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str)
         root = ET.fromstring(xml_str)
@@ -27,48 +26,76 @@ def extrair_dados_xml(conteudo_bytes):
                     return el.text.strip()
             return ""
 
-        numero = buscar_tag(['nNF', 'Numero', 'numeroNota'])
-        cnpj = buscar_tag(['CNPJ', 'Cnpj', 'cnpjPrestador', 'cnpjEmitente'])
-        razao_social = buscar_tag(['xNome', 'RazaoSocial', 'nomePrestador', 'nomeEmitente'])
-        valor = buscar_tag(['vNF', 'ValorServicos', 'valorLiquido', 'vProd'])
-        data = buscar_tag(['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi'])
+        numero = buscar_tag(['nNF', 'Numero', 'numeroNota', 'nNFse'])
+        cnpj = buscar_tag(['CNPJ', 'Cnpj', 'cnpjPrestador', 'cnpjEmitente', 'chNFe'])
+        razao_social = buscar_tag(['xNome', 'RazaoSocial', 'nomePrestador', 'nomeEmitente', 'xFant'])
+        valor = buscar_tag(['vNF', 'ValorServicos', 'valorLiquido', 'vProd', 'vBC'])
+        data = buscar_tag(['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi', 'dhCompetencia'])
         
         if data and len(data) >= 10:
             data = data[:10]
 
+        # Tratamento caso o CNPJ venha dentro da chave de acesso (chNFe)
+        if cnpj and len(cnpj) == 44:
+            cnpj = cnpj[6:20]
+
         return {
-            "Número da Nota": numero,
-            "Razão Social": razao_social,
-            "CNPJ": cnpj,
-            "Valor": valor,
-            "Data": data,
-            "Fornecedor": razao_social
+            "Número da Nota": numero if numero else "Não encontrado",
+            "Razão Social": razao_social if razao_social else "Não encontrado",
+            "CNPJ": cnpj if cnpj else "Não encontrado",
+            "Valor": valor if valor else "Não encontrado",
+            "Data": data if data else "Não encontrado",
+            "Fornecedor": razao_social if razao_social else "Não encontrado"
         }
-    except Exception:
-        return None
+    except Exception as e:
+        return {
+            "Número da Nota": "Erro no XML",
+            "Razão Social": "Erro de Leitura",
+            "CNPJ": "Erro de Leitura",
+            "Valor": "",
+            "Data": "",
+            "Fornecedor": f"Erro: {str(e)[:20]}"
+        }
 
 def extrair_dados_pdf(conteudo_bytes):
-    """Extrai dados de um PDF usando Expressões Regulares (Regex)."""
+    """Extrai dados de um PDF usando Expressões Regulares mais abrangentes."""
     try:
         pdf = PdfReader(io.BytesIO(conteudo_bytes))
         texto = ""
         for page in pdf.pages:
             texto += page.extract_text() or ""
             
-        if not texto:
-            return None
+        if not texto.strip():
+            return {
+                "Número da Nota": "PDF sem texto (Imagem)",
+                "Razão Social": "Requer OCR",
+                "CNPJ": "Requer OCR",
+                "Valor": "",
+                "Data": "",
+                "Fornecedor": "PDF Escaneado"
+            }
 
-        numero_match = re.search(r'(?:NÚMERO|NUMERO|Nº|Nota Nº)\s*[:.]?\s*(\d+)', texto, re.IGNORECASE)
+        # Regex aprimorados e mais tolerantes a espaços e quebras de linha
+        numero_match = re.search(r'(?:NÚMERO|NUMERO|Nº|Nota Nº|Nota:)\s*[:.]?\s*(\d+)', texto, re.IGNORECASE)
         cnpj_match = re.search(r'(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{14})', texto)
-        valor_match = re.search(r'(?:VALOR TOTAL|VALOR LIQUIDO|TOTAL DA NOTA|R\$)\s*[:.]?\s*([\d.,]+)', texto, re.IGNORECASE)
-        data_match = re.search(r'(\d{2}/\d{2}/\d{4})', texto)
-        razao_match = re.search(r'(?:Razão Social|Razao Social|Prestador|Emitente)\s*[:.]?\s*([A-Za-z0-9 ]+)', texto, re.IGNORECASE)
+        
+        # Captura valores com pontuação brasileira (ex: 2.485.739,00 ou 933,33)
+        valor_match = re.search(r'(?:VALOR TOTAL|VALOR LÍQUIDO|VALOR LIQUIDO|TOTAL DA NOTA|R\$)\s*[:.]?\s*([\d.,]+)', texto, re.IGNORECASE)
+        if not valor_match:
+            # Busca secundária por qualquer formato monetário comum se o principal falhar
+            valor_match = re.search(r'R\$\s*([\d.,]+)', texto)
 
-        numero = numero_match.group(1) if numero_match else ""
-        cnpj = cnpj_match.group(1) if cnpj_match else ""
-        valor = valor_match.group(1) if valor_match else ""
-        data = data_match.group(1) if data_match else ""
-        razao_social = razao_match.group(1).strip() if razao_match else "Verificar no PDF"
+        data_match = re.search(r'(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})', texto)
+        razao_match = re.search(r'(?:Razão Social|Razao Social|Prestador|Emitente|Nome/Razão Social)\s*[:.]?\s*([^\n\t]+)', texto, re.IGNORECASE)
+
+        numero = numero_match.group(1) if numero_match else "Não encontrado"
+        cnpj = cnpj_match.group(1) if cnpj_match else "Não encontrado"
+        valor = valor_match.group(1) if valor_match else "Não encontrado"
+        data = data_match.group(1) if data_match else "Não encontrado"
+        
+        razao_social = razao_match.group(1).strip() if razao_match else ""
+        if not razao_social or len(razao_social) < 3:
+            razao_social = "Verificar no PDF"
 
         return {
             "Número da Nota": numero,
@@ -78,13 +105,20 @@ def extrair_dados_pdf(conteudo_bytes):
             "Data": data,
             "Fornecedor": razao_social
         }
-    except Exception:
-        return None
+    except Exception as e:
+        return {
+            "Número da Nota": "Erro no PDF",
+            "Razão Social": "Erro de Leitura",
+            "CNPJ": "Erro de Leitura",
+            "Valor": "",
+            "Data": "",
+            "Fornecedor": f"Erro: {str(e)[:20]}"
+        }
 
 # --- PROCESSADOR INDIVIDUAL ---
 
 def processar_arquivo(item):
-    """Processa um único arquivo com base na extensão."""
+    """Processa obrigatoriamente o arquivo e retorna uma linha estruturada."""
     nome_arquivo, conteudo = item
     nome_lower = nome_arquivo.lower()
     
@@ -94,10 +128,19 @@ def processar_arquivo(item):
     elif nome_lower.endswith('.pdf'):
         dados = extrair_dados_pdf(conteudo)
         
-    if dados:
-        dados["Arquivo"] = os.path.basename(nome_arquivo)
-        return dados
-    return None
+    # Se por qualquer motivo retornar vazio, criamos uma linha padrão para não perder o arquivo da contagem
+    if not dados:
+        dados = {
+            "Número da Nota": "Não suportado",
+            "Razão Social": "Formato inválido",
+            "CNPJ": "Formato inválido",
+            "Valor": "",
+            "Data": "",
+            "Fornecedor": "Não identificado"
+        }
+        
+    dados["Arquivo"] = os.path.basename(nome_arquivo)
+    return dados
 
 # --- INTERFACE DO STREAMLIT ---
 
@@ -113,7 +156,6 @@ arquivos_carregados = st.file_uploader(
 if arquivos_carregados:
     lista_arquivos = []
     
-    # 1. Desempacota e lê os arquivos na memória
     with st.spinner("Lendo arquivos enviados..."):
         for arq in arquivos_carregados:
             if arq.name.lower().endswith('.zip'):
@@ -134,37 +176,30 @@ if arquivos_carregados:
     if total_arquivos > 0:
         st.info(f"Total de {total_arquivos} notas fiscais detectadas. Iniciando processamento...")
         
-        # Progress bar
         barra_progresso = st.progress(0)
-        
-        # 2. Processamento Paralelo utilizando Threads para alta velocidade
         resultados = []
         max_workers = min(32, (os.cpu_count() or 4) * 4) 
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for i, resultado in enumerate(executor.map(processar_arquivo, lista_arquivos)):
-                if resultado:
-                    resultados.append(resultado)
+                resultados.append(resultado)
                 barra_progresso.progress((i + 1) / total_arquivos)
 
-        # 3. Exibição dos resultados
         if resultados:
             df = pd.DataFrame(resultados)
             
-            # Garante que todas as colunas pedidas existam na ordem correta
             colunas_ordem = ["Número da Nota", "Razão Social", "CNPJ", "Valor", "Data", "Fornecedor", "Arquivo"]
             for col in colunas_ordem:
                 if col not in df.columns:
                     df[col] = ""
             df = df[colunas_ordem]
             
-            st.success(f"Sucesso! {len(resultados)} notas processadas com êxito.")
+            # Alerta visual caso o total mapeado seja diferente do esperado para auditoria rápida
+            st.success(f"Sucesso! {len(df)} linhas geradas para as {total_arquivos} notas encontradas.")
             
-            # Pré-visualização da Tabela
             st.subheader("📋 Pré-visualização dos Dados")
             st.dataframe(df, use_container_width=True)
             
-            # 4. Geração do arquivo Excel na memória para Download
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Notas Fiscais')
@@ -177,6 +212,6 @@ if arquivos_carregados:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.warning("Nenhum dado pôde ser extraído dos arquivos enviados. Verifique o formato dos PDFs/XMLs.")
+            st.warning("Nenhum dado pôde ser processado.")
     else:
         st.warning("Nenhum arquivo válido (.xml ou .pdf) foi encontrado.")
