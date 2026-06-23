@@ -4,63 +4,65 @@ import xml.etree.ElementTree as ET
 import pdfplumber
 import zipfile
 import io
-import re
 import os
-from concurrent.futures import ThreadPoolExecutor
+import json
+import google.generativeai as genai
+import time
 
-st.set_page_config(page_title="Extrator de Notas Fiscais (Motor Espacial)", layout="wide")
+st.set_page_config(page_title="Extrator de Notas Fiscais (IA Inteligente)", layout="wide")
 
-# --- MOTOR DE RECONSTRUÇÃO ESPACIAL ---
+# --- CONFIGURAÇÃO DA IA ---
+# A chave de API deve ser configurada nos Secrets do Streamlit Cloud
+CHAVE_API = st.secrets.get("GEMINI_API_KEY", "")
 
-def extrair_texto_espacial(pagina):
+if CHAVE_API:
+    genai.configure(api_key=CHAVE_API)
+    # Usamos o modelo flash por ser rápido e excelente em extração de dados
+    modelo_ia = genai.GenerativeModel('gemini-1.5-flash')
+
+# --- FUNÇÃO DA INTELIGÊNCIA ARTIFICIAL ---
+def extrair_dados_com_ia(texto_nota):
+    """Envia o texto da nota para a IA analisar o contexto e extrair os dados."""
+    prompt = f"""
+    Você é um assistente especialista em contabilidade e notas fiscais brasileiras (NFS-e e NF-e).
+    Vou te passar o texto extraído de um PDF de nota fiscal. O texto pode estar bagunçado.
+    Leia com calma, analise o contexto e encontre exatamente os seguintes dados:
+    1. Número da Nota
+    2. CNPJ do Fornecedor (Prestador do serviço ou Emitente. Ignore o CNPJ do tomador/cliente ou da prefeitura).
+    3. Nome do Fornecedor (Razão Social ou Nome Fantasia do Prestador/Emitente. Não confunda com órgãos públicos ou com o cliente).
+    4. Valor Total ou Líquido da nota.
+    5. Data de Emissão.
+
+    Retorne APENAS um objeto JSON válido e nada mais, com estas chaves exatas:
+    {{"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}}
+    Se não encontrar algum dado com certeza, deixe a string vazia "".
+
+    Texto da Nota Fiscal:
+    {texto_nota}
     """
-    Extrai as palavras do PDF pelas coordenadas matemáticas (X, Y).
-    Isso impede que colunas distantes se misturem na mesma linha.
-    """
-    palavras = pagina.extract_words()
-    if not palavras:
-        return []
     
-    # Ordena de cima para baixo
-    palavras.sort(key=lambda w: w['top'])
-    
-    linhas = []
-    linha_atual = []
-    top_atual = palavras[0]['top']
-    
-    # Agrupa palavras que estão na mesma altura (tolerância de 4 pixels)
-    for p in palavras:
-        if abs(p['top'] - top_atual) <= 4:
-            linha_atual.append(p)
-        else:
-            # Ordena a linha da esquerda para a direita
-            linha_atual.sort(key=lambda w: w['x0'])
-            linhas.append(" ".join([w['text'] for w in linha_atual]))
-            linha_atual = [p]
-            top_atual = p['top']
-            
-    if linha_atual:
-        linha_atual.sort(key=lambda w: w['x0'])
-        linhas.append(" ".join([w['text'] for w in linha_atual]))
+    try:
+        resposta = modelo_ia.generate_content(prompt)
+        texto_resposta = resposta.text.strip()
         
-    return linhas
+        # Limpa formatações markdown caso a IA retorne com elas
+        if texto_resposta.startswith("```json"):
+            texto_resposta = texto_resposta[7:-3]
+        elif texto_resposta.startswith("```"):
+            texto_resposta = texto_resposta[3:-3]
+            
+        dados_json = json.loads(texto_resposta.strip())
+        return dados_json
+    except Exception as e:
+        return {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
 
-def eh_texto_lixo(texto):
-    """Verifica se a linha é um rótulo do governo e não o nome da empresa."""
-    lixos = ["PREFEITURA", "MUNICÍPIO", "SECRETARIA", "NOTA FISCAL", "NFS-E", 
-             "DANFE", "DOCUMENTO", "DADOS", "PRESTADOR", "EMITENTE", "TOMADOR"]
-    texto_upper = texto.upper()
-    for lixo in lixos:
-        if lixo in texto_upper:
-            return True
-    return False
-
-# --- FUNÇÕES DE EXTRAÇÃO DE DADOS ---
-
+# --- EXTRAÇÃO DE ARQUIVOS ---
 def extrair_dados_xml(conteudo_bytes):
+    """Para XML, a extração via código é 100% segura, não precisa de IA."""
     dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
     try:
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
+        import re
         xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str) 
         root = ET.fromstring(xml_str)
         
@@ -87,107 +89,13 @@ def extrair_dados_xml(conteudo_bytes):
 
         data = buscar_tag(['dhEmi', 'DataEmissao', 'dtEmissao', 'dEmi'])
         if data and len(data) >= 10:
-            data = data[:10]
-            if "-" in data:
-                p = data.split("-")
-                if len(p) == 3: dados["Data"] = f"{p[2]}/{p[1]}/{p[0]}"
-            else:
-                dados["Data"] = data
+            dados["Data"] = data[:10]
     except Exception:
         pass
     return dados
 
-def extrair_dados_pdf(conteudo_bytes):
-    dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
-    linhas = []
-    texto_corrido = ""
-
-    try:
-        with pdfplumber.open(io.BytesIO(conteudo_bytes)) as pdf:
-            for pagina in pdf.pages:
-                linhas_pagina = extrair_texto_espacial(pagina)
-                linhas.extend(linhas_pagina)
-                texto_corrido += "\n".join(linhas_pagina) + "\n"
-    except Exception:
-        return dados
-
-    if not linhas:
-        return dados
-
-    # 1. CNPJ DO FORNECEDOR (O primeiro válido no documento)
-    cnpjs = re.findall(r'\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b', texto_corrido)
-    if cnpjs:
-        dados["CNPJ"] = cnpjs[0]
-
-    # 2. FORNECEDOR
-    fornecedor = ""
-    for i, linha in enumerate(linhas):
-        # Procura a âncora do rótulo
-        m_razao = re.search(r'(?:Razão Social|Nome Fantasia|Nome/Razão Social|Nome Empresarial)\s*[:\-]?\s*(.+)', linha, re.IGNORECASE)
-        if m_razao:
-            cand = m_razao.group(1).strip()
-            # Se a linha não tiver CNPJ ou Endereço grudado e for maior que 3 letras
-            if len(cand) > 3 and not re.search(r'(?:CNPJ|CPF|Endereço|Inscrição|CEP)', cand, re.IGNORECASE):
-                fornecedor = cand
-                break
-        
-        # Se encontrou o bloco do emitente, o nome costuma estar na linha de baixo
-        if re.search(r'^(?:PRESTADOR DE SERVIÇOS|EMITENTE DA NOTA|DADOS DO PRESTADOR)', linha, re.IGNORECASE):
-            if i + 1 < len(linhas):
-                cand_abaixo = linhas[i+1].strip()
-                if len(cand_abaixo) > 3 and not eh_texto_lixo(cand_abaixo) and not re.search(r'(?:CNPJ|CPF)', cand_abaixo):
-                    # Tira rótulos se vieram grudados
-                    cand_abaixo = re.sub(r'^(?:Razão Social|Nome Fantasia)[\s:]*', '', cand_abaixo, flags=re.IGNORECASE).strip()
-                    fornecedor = cand_abaixo
-                    break
-
-    # Se não achou por rótulo, usa o CNPJ como âncora e pega a linha de cima
-    if not fornecedor and dados["CNPJ"]:
-        for i, linha in enumerate(linhas):
-            if dados["CNPJ"] in linha and i > 0:
-                cand_acima = linhas[i-1].strip()
-                if not eh_texto_lixo(cand_acima) and len(cand_acima) > 3:
-                    cand_acima = re.sub(r'^(?:Razão Social|Nome Fantasia)[\s:]*', '', cand_acima, flags=re.IGNORECASE).strip()
-                    fornecedor = cand_acima
-                    break
-    
-    dados["Fornecedor"] = fornecedor.strip(" -:.,") if fornecedor else ""
-
-    # 3. NÚMERO DA NOTA
-    # Notas padrão e NFS-e Nacional
-    for linha in linhas[:20]:
-        m = re.search(r'(?:Número da Nota|Número NFS-e|Nº|Nota Nº|NFS-e|Número do Documento)[\s\:\-\.]*0*(\d+)', linha, re.IGNORECASE)
-        if m:
-            dados["Número da Nota"] = m.group(1)
-            break
-            
-    # Se não achou na busca estrutural, varre o texto corrido
-    if not dados["Número da Nota"]:
-        m_num = re.search(r'Nº[\s]*0*(\d+)', texto_corrido, re.IGNORECASE)
-        if m_num: dados["Número da Nota"] = m_num.group(1)
-
-    # 4. DATA
-    m_data = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', texto_corrido)
-    if m_data:
-        dados["Data"] = m_data.group(1)
-
-    # 5. VALOR
-    for linha in linhas:
-        m_val = re.search(r'(?:Valor Total|Total da Nota|Valor Líquido|Valor dos Serviços)[\s\:\.]*R?\$?\s*([\d\.]+(?:,\d{2}))', linha, re.IGNORECASE)
-        if m_val:
-            dados["Valor"] = m_val.group(1)
-            break
-            
-    if not dados["Valor"]:
-        valores = re.findall(r'R\$\s*([\d\.]+(?:,\d{2}))', texto_corrido)
-        if valores:
-            dados["Valor"] = valores[-1]
-
-    return dados
-
-# --- PROCESSADOR INDIVIDUAL ---
-
 def processar_arquivo(item):
+    """Lê o arquivo um por um, com calma."""
     nome_arquivo, conteudo = item
     nome_lower = nome_arquivo.lower()
     
@@ -195,7 +103,21 @@ def processar_arquivo(item):
     if nome_lower.endswith('.xml'):
         dados = extrair_dados_xml(conteudo)
     elif nome_lower.endswith('.pdf'):
-        dados = extrair_dados_pdf(conteudo)
+        # Extrai o texto base
+        texto_pdf = ""
+        try:
+            with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
+                for pagina in pdf.pages:
+                    t = pagina.extract_text()
+                    if t: texto_pdf += t + "\n"
+        except Exception:
+            pass
+            
+        if texto_pdf.strip():
+            # Passa para a IA ler com contexto humano
+            dados = extrair_dados_com_ia(texto_pdf)
+            # Pausa de 1 segundo para não sobrecarregar a API gratuita
+            time.sleep(1)
         
     if not dados:
         dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
@@ -204,9 +126,11 @@ def processar_arquivo(item):
     return dados
 
 # --- INTERFACE DO STREAMLIT ---
+st.title("🧠 Extrator de Notas Fiscais Inteligente (Com IA)")
+st.write("Este sistema usa Inteligência Artificial para ler cada PDF e interpretar os dados de fornecedores, ignorando formatos confusos de prefeituras.")
 
-st.title("⚡ Extrator de Notas Fiscais (Motor Espacial)")
-st.write("Anexe arquivos soltos ou um arquivo **.ZIP**. Este extrator utiliza coordenadas visuais para impedir que colunas se misturem.")
+if not CHAVE_API:
+    st.error("⚠️ Falta configurar a chave da API do Gemini. Vá nos Secrets do Streamlit e adicione `GEMINI_API_KEY = 'sua_chave'`.")
 
 arquivos_carregados = st.file_uploader(
     "Escolha os arquivos XML/PDF ou um arquivo ZIP", 
@@ -214,10 +138,10 @@ arquivos_carregados = st.file_uploader(
     accept_multiple_files=True
 )
 
-if arquivos_carregados:
+if arquivos_carregados and CHAVE_API:
     lista_arquivos = []
     
-    with st.spinner("Lendo arquivos enviados..."):
+    with st.spinner("Desempacotando arquivos enviados..."):
         for arq in arquivos_carregados:
             if arq.name.lower().endswith('.zip'):
                 try:
@@ -235,16 +159,16 @@ if arquivos_carregados:
     total_arquivos = len(lista_arquivos)
     
     if total_arquivos > 0:
-        st.info(f"Total de {total_arquivos} notas detectadas. Iniciando processamento...")
+        st.info(f"Total de {total_arquivos} notas detectadas. A IA fará a leitura individual detalhada (isso pode levar alguns minutos)...")
         
         barra_progresso = st.progress(0)
         resultados = []
-        max_workers = min(16, (os.cpu_count() or 2) * 4) 
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for i, resultado in enumerate(executor.map(processar_arquivo, lista_arquivos)):
-                resultados.append(resultado)
-                barra_progresso.progress((i + 1) / total_arquivos)
+        # Leitura sequencial "com calma", uma por vez, para alta precisão e sem estourar limites de API
+        for i, item in enumerate(lista_arquivos):
+            resultado = processar_arquivo(item)
+            resultados.append(resultado)
+            barra_progresso.progress((i + 1) / total_arquivos)
 
         if resultados:
             df = pd.DataFrame(resultados)
@@ -255,7 +179,7 @@ if arquivos_carregados:
                     df[col] = ""
             df = df[colunas_ordem]
             
-            st.success(f"Processamento concluído para {total_arquivos} notas.")
+            st.success(f"Leitura concluída com precisão para {total_arquivos} notas.")
             
             st.subheader("📋 Pré-visualização dos Dados")
             st.dataframe(df, use_container_width=True)
@@ -273,5 +197,3 @@ if arquivos_carregados:
             )
         else:
             st.warning("Nenhum dado pôde ser processado.")
-    else:
-        st.warning("Nenhum arquivo válido (.xml ou .pdf) foi encontrado.")
