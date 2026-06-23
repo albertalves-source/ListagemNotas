@@ -8,39 +8,15 @@ import re
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-st.set_page_config(page_title="Extrator de Notas Fiscais (Leitura Profunda)", layout="wide")
+st.set_page_config(page_title="Extrator de Notas Fiscais (Layouts Mistos)", layout="wide")
 
-# --- LISTA NEGRA DE PALAVRAS (Evita pegar prefeituras e lixos) ---
-BLACKLIST_FORNECEDOR = [
-    "PREFEITURA", "MUNICÍPIO", "MUNICIPIO", "SECRETARIA", "ESTADO", "GOVERNO",
-    "NOTA FISCAL", "ELETRÔNICA", "ELETRONICA", "NFS-E", "NF-E", "DANFE",
-    "DOCUMENTO", "AUXILIAR", "IMPOSTO", "TRIBUTO", "TOMADOR", "DESTINATÁRIO",
-    "COMPROVANTE", "RECIBO", "DADOS DO", "PRESTADOR", "EMITENTE", "SERVIÇO",
-    "ENDEREÇO", "BAIRRO", "CEP", "MUNICÍPIO", "UF", "TELEFONE", "E-MAIL"
-]
-
-def texto_valido_para_fornecedor(texto):
-    """Verifica se o texto capturado não é um título ou lixo do layout."""
-    texto_upper = texto.upper()
-    if len(texto) < 3:
-        return False
-    # Se contém qualquer palavra da lista negra, é lixo
-    for palavra in BLACKLIST_FORNECEDOR:
-        if palavra in texto_upper:
-            return False
-    # Se for só números ou começar com endereço, é lixo
-    if re.search(r'^\d+$', texto) or re.search(r'^(RUA|AV|AVENIDA|ALAMEDA|TRAVESSA|RODOVIA|LOTE|QDA|QUADRA)', texto_upper):
-        return False
-    return True
-
-# --- FUNÇÕES DE EXTRAÇÃO ---
+# --- FUNÇÕES DE EXTRAÇÃO EXATA ---
 
 def extrair_dados_xml(conteudo_bytes):
-    """Extração 100% precisa das tags do XML."""
     dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
     try:
         xml_str = conteudo_bytes.decode('utf-8', errors='ignore')
-        xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str) # Remove namespaces para não atrapalhar
+        xml_str = re.sub(r'xmlns="[^"]*"', '', xml_str) 
         root = ET.fromstring(xml_str)
         
         def buscar_tag(tags, parent=root):
@@ -54,7 +30,6 @@ def extrair_dados_xml(conteudo_bytes):
         numero = buscar_tag(['nNF', 'Numero', 'numeroNota', 'nNFse'])
         if numero: dados["Número da Nota"] = numero.lstrip('0')
 
-        # Garante que pega do Prestador e não do Tomador
         prestador = root.find('.//Prestador') or root.find('.//emit') or root.find('.//PrestadorServico')
         if prestador is not None:
             dados["CNPJ"] = buscar_tag(['CNPJ', 'Cnpj'], prestador)
@@ -77,84 +52,115 @@ def extrair_dados_xml(conteudo_bytes):
         pass
     return dados
 
+def limpar_fornecedor(texto):
+    """Remove sujeiras comuns capturadas junto com o nome do fornecedor."""
+    # Corta o texto se ele juntou com colunas de CNPJ, Endereço ou CPF
+    texto = re.split(r'\s{2,}|CNPJ|CPF|Inscrição|Endereço|Município|Telefone', texto, flags=re.IGNORECASE)[0]
+    return texto.strip(" :-.,\n")
+
 def extrair_dados_pdf(conteudo_bytes):
-    """Leitura profunda do PDF ancorada pelo CNPJ."""
     dados = {"Número da Nota": "", "CNPJ": "", "Valor": "", "Data": "", "Fornecedor": ""}
-    texto_completo = ""
+    texto_simples = ""
     linhas = []
 
     try:
         with pdfplumber.open(io.BytesIO(conteudo_bytes)) as pdf:
             for pagina in pdf.pages:
+                # Extrai o texto normal
                 t = pagina.extract_text()
-                if t: 
-                    texto_completo += t + "\n"
-                    # Quebra mantendo a ordem original da leitura
+                if t:
+                    texto_simples += t + "\n"
                     linhas.extend([l.strip() for l in t.split('\n') if l.strip()])
     except Exception:
-        return dados # Se falhar ao abrir, retorna vazio
+        return dados 
 
     if not linhas:
-        return dados # PDF sem texto copiável (imagem)
+        return dados
 
-    # 1. CNPJ DO FORNECEDOR
-    # O primeiro CNPJ do documento em uma nota de serviço é invariavelmente o do Prestador
-    cnpjs = re.findall(r'\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b', texto_completo)
+    # 1. CNPJ DO FORNECEDOR (O primeiro CNPJ da nota é sempre o Emitente/Prestador)
+    cnpjs = re.findall(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto_simples)
     if cnpjs:
         dados["CNPJ"] = cnpjs[0]
+    else:
+        # Tenta achar CNPJ sem pontuação
+        cnpjs_puros = re.findall(r'\b\d{14}\b', texto_simples)
+        # Ignora se for chave de acesso (44 digitos)
+        for c in cnpjs_puros:
+            if not re.search(r'\b\d{44}\b', texto_simples):
+                dados["CNPJ"] = f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
+                break
 
-    # 2. FORNECEDOR (Ancorado no CNPJ)
-    if dados["CNPJ"]:
-        for i, linha in enumerate(linhas):
-            if dados["CNPJ"] in linha:
-                # Estratégia A: O nome está na mesma linha, antes do CNPJ
-                texto_antes = linha.split(dados["CNPJ"])[0].strip()
-                texto_antes = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente|Nome)[\s:\-\.]*', '', texto_antes, flags=re.IGNORECASE).strip()
-                texto_antes = re.sub(r'(?:CNPJ|CPF)[\s:\-\.]*$', '', texto_antes, flags=re.IGNORECASE).strip()
-                
-                if texto_valido_para_fornecedor(texto_antes):
-                    dados["Fornecedor"] = texto_antes
-                    break
-                
-                # Estratégia B: O nome está na linha imediatamente ACIMA do CNPJ
-                if i > 0:
-                    linha_cima = linhas[i-1]
-                    linha_cima = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente|Nome)[\s:\-\.]*', '', linha_cima, flags=re.IGNORECASE).strip()
-                    if texto_valido_para_fornecedor(linha_cima):
-                        dados["Fornecedor"] = linha_cima
-                        break
-                        
-                # Estratégia C: O nome está duas linhas ACIMA do CNPJ (comum em tabelas quebradas)
-                if i > 1:
-                    linha_cima_dois = linhas[i-2]
-                    linha_cima_dois = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente|Nome)[\s:\-\.]*', '', linha_cima_dois, flags=re.IGNORECASE).strip()
-                    if texto_valido_para_fornecedor(linha_cima_dois):
-                        dados["Fornecedor"] = linha_cima_dois
-                        break
-
-    # 3. NÚMERO DA NOTA
-    # Procura estritamente por rótulos de número de nota perto do topo do documento
-    for linha in linhas[:30]: 
-        m = re.search(r'(?:N[UÚ]MERO|N[uú]mero da Nota|Nº|NF-e|NFS-e|Nota)[\s:\-\.]*0*(\d{1,15})\b', linha, re.IGNORECASE)
+    # 2. NÚMERO DA NOTA
+    # Busca por rótulos variados que as prefeituras e o estado (NF-e) usam
+    for linha in linhas[:30]: # Geralmente o número está no topo
+        m = re.search(r'(?:Número da Nota|Número da NFS-e|NFS-e Número|Número do Documento|Nº da Nota|Nota Fiscal Nº|Nº|Número|NFS-e)[\s\:\-\.]*([0-9\.\-]+)', linha, re.IGNORECASE)
         if m:
-            dados["Número da Nota"] = m.group(1)
-            break
+            num_limpo = re.sub(r'\D', '', m.group(1)).lstrip('0')
+            if num_limpo:
+                dados["Número da Nota"] = num_limpo
+                break
+
+    # Fallback para DANFE (NF-e de produto) usando a chave de acesso de 44 dígitos
+    if not dados["Número da Nota"]:
+        chaves = re.findall(r'\b\d{44}\b', texto_simples)
+        if chaves:
+            chave = chaves[0]
+            # O número da NF-e padrão fica entre os dígitos 25 e 33 da chave de acesso
+            dados["Número da Nota"] = chave[25:34].lstrip('0')
+
+    # 3. FORNECEDOR (Estratégia de Blocos)
+    fornecedor = ""
+    for i, linha in enumerate(linhas):
+        # A. Procura a âncora direta na linha
+        m_razao = re.search(r'(?:Razão Social|Nome/Razão Social|Nome Empresarial|Nome Fantasia)[\s\:\-\.]*(.+)', linha, re.IGNORECASE)
+        if m_razao:
+            nome_candidato = limpar_fornecedor(m_razao.group(1))
+            if len(nome_candidato) > 3:
+                fornecedor = nome_candidato
+                break
+
+        # B. Procura o bloco "Prestador" ou "Emitente" e desce a linha
+        if re.search(r'^(?:PRESTADOR DE SERVI[ÇC]OS|EMITENTE|DADOS DO PRESTADOR|DADOS DO EMITENTE)', linha, re.IGNORECASE):
+            for j in range(1, 4):
+                if i + j < len(linhas):
+                    linha_abaixo = linhas[i+j]
+                    # Ignora se for um rótulo de outra coisa
+                    if re.search(r'^(?:CNPJ|CPF|Inscrição|Endereço|Município|Telefone|E-mail)', linha_abaixo, re.IGNORECASE):
+                        continue
+                    # Ignora se for a palavra "Razão Social" sozinha
+                    if re.search(r'^(?:Razão Social|Nome Fantasia)[\s\:]*$', linha_abaixo, re.IGNORECASE):
+                        continue
+                    
+                    nome_candidato = limpar_fornecedor(linha_abaixo)
+                    if len(nome_candidato) > 3:
+                        fornecedor = nome_candidato
+                        break
+            if fornecedor:
+                break
+
+    # C. Fallback: Se achou o CNPJ, pega a linha imediatamente acima dele (MUITO comum em Salvador e afins)
+    if not fornecedor and dados["CNPJ"]:
+        for i, linha in enumerate(linhas):
+            if dados["CNPJ"] in linha and i > 0:
+                linha_acima = linhas[i-1]
+                linha_acima = re.sub(r'^(?:Razão Social|Nome Fantasia|Prestador|Emitente|Nome)[\s\:\-\.]*', '', linha_acima, flags=re.IGNORECASE).strip()
+                if len(linha_acima) > 3 and not re.search(r'(?:Prefeitura|Município|Secretaria|Nota Fiscal|Documento)', linha_acima, re.IGNORECASE):
+                    fornecedor = limpar_fornecedor(linha_acima)
+                    break
+
+    dados["Fornecedor"] = fornecedor
 
     # 4. VALOR
-    # Busca pela palavra "Total" ou "Líquido"
-    for linha in linhas:
-        m = re.search(r'(?:Total|Líquido|Liquido|Valor da Nota|Valor do Serviço)[\s:\-\.]*R?\$?\s*([\d\.]+(?:,\d{2}))', linha, re.IGNORECASE)
-        if m:
-            dados["Valor"] = m.group(1)
-            break
-    # Se não achou com rótulo, pega o último valor monetário do documento
-    if not dados["Valor"]:
-        valores = re.findall(r'R\$\s*([\d\.]+(?:,\d{2}))', texto_completo)
+    m_valor = re.search(r'(?:Valor Total da Nota|Valor Líquido|Total da NFS-e|Valor do Serviço|VALOR TOTAL|Total|Líquido)[\s\:\.\-]*R?\$?\s*([\d\.]+(?:,\d{2}))', texto_simples, re.IGNORECASE)
+    if m_valor:
+        dados["Valor"] = m_valor.group(1)
+    else:
+        valores = re.findall(r'R\$\s*([\d\.]+(?:,\d{2}))', texto_simples)
         if valores:
             dados["Valor"] = valores[-1]
 
     # 5. DATA
-    m_data = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', texto_completo)
+    m_data = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', texto_simples)
     if m_data:
         dados["Data"] = m_data.group(1)
 
@@ -180,8 +186,8 @@ def processar_arquivo(item):
 
 # --- INTERFACE DO STREAMLIT ---
 
-st.title("⚡ Extrator de Notas Fiscais (Leitura Profunda)")
-st.write("Anexe arquivos soltos ou um arquivo **.ZIP** contendo as notas fiscais. O sistema fará uma leitura cautelosa de cada arquivo.")
+st.title("⚡ Extrator de Notas Fiscais (Layouts Mistos)")
+st.write("Processamento otimizado para DANFE (NF-e) e notas municipais (NFS-e) variadas.")
 
 arquivos_carregados = st.file_uploader(
     "Escolha os arquivos XML/PDF ou um arquivo ZIP", 
@@ -210,13 +216,11 @@ if arquivos_carregados:
     total_arquivos = len(lista_arquivos)
     
     if total_arquivos > 0:
-        st.info(f"Total de {total_arquivos} notas detectadas. Iniciando processamento cuidadoso...")
+        st.info(f"Total de {total_arquivos} notas detectadas. Iniciando processamento...")
         
         barra_progresso = st.progress(0)
         resultados = []
-        
-        # Reduzido o número de processos paralelos para garantir estabilidade na leitura profunda
-        max_workers = min(10, (os.cpu_count() or 2) * 2) 
+        max_workers = min(16, (os.cpu_count() or 2) * 4) 
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for i, resultado in enumerate(executor.map(processar_arquivo, lista_arquivos)):
