@@ -17,7 +17,7 @@ CHAVE_API = st.secrets.get("GEMINI_API_KEY", "")
 
 if CHAVE_API:
     genai.configure(api_key=CHAVE_API)
-    modelo_ia = genai.GenerativeModel('gemini-1.5-flash')
+    modelo_ia = genai.GenerativeModel('models/gemini-1.5-flash-latest')
 
 # --- FUNÇÃO DA INTELIGÊNCIA ARTIFICIAL ---
 def extrair_dados_com_ia(texto_nota):
